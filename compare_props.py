@@ -30,14 +30,20 @@ def compare_props(file1_path, file2_path):
     props2 = parse_getprop_file(file2_path)
     
     missing_in_file2 = []
+    missing_in_file1 = []
     changed_props = []
     
-    # Check for missing and changed properties
+    # Check for missing in file 2 and changed properties
     for key, value1 in props1.items():
         if key not in props2:
             missing_in_file2.append((key, value1))
         elif props2[key] != value1:
             changed_props.append((key, value1, props2[key]))
+            
+    # Check for missing in file 1
+    for key, value2 in props2.items():
+        if key not in props1:
+            missing_in_file1.append((key, value2))
             
     # Output formatting
     print(f"==================================================")
@@ -51,8 +57,16 @@ def compare_props(file1_path, file2_path):
             print(f"    Was: {val}")
     else:
         print("    None. No properties from the first file are missing in the second.")
+
+    print("\n### 2. Properties Missing in First File ###")
+    if missing_in_file1:
+        for key, val in sorted(missing_in_file1):
+            print(f"[+] {key}")
+            print(f"    New: {val}")
+    else:
+        print("    None. No properties from the second file are missing in the first.")
         
-    print("\n### 2. Properties with Changed Values ###")
+    print("\n### 3. Properties with Changed Values ###")
     if changed_props:
         for key, val1, val2 in sorted(changed_props):
             print(f"[*] {key}")
