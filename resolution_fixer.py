@@ -14,7 +14,6 @@ def suggest_ideal_dpi(w2, h2):
         diag_pixels = math.hypot(w2, h2)
         true_dpi = round(diag_pixels / inches)
         
-        # Standard Android display density buckets
         standard_buckets = [120, 160, 240, 320, 480, 640, 800]
         closest_bucket = min(standard_buckets, key=lambda x: abs(x - true_dpi))
         
@@ -53,10 +52,31 @@ def main():
         dpi1 = int(input("Enter current DPI (e.g., 160): ").strip())
         
         # Get target specs
-        out_res = input("\nEnter target resolution (e.g., 720x1200) OR press Enter to see suggestions: ").lower().strip()
+        prompt_text = "\nEnter target resolution (e.g., 720x1200, 720x, or x1520) OR press Enter to see suggestions: "
+        out_res = input(prompt_text).lower().strip()
         
         if out_res:
-            w2, h2 = map(int, out_res.split('x'))
+            parts = out_res.split('x')
+            if len(parts) != 2:
+                print("\nError: Target resolution must contain exactly one 'x'.")
+                return
+
+            w2_str, h2_str = parts[0].strip(), parts[1].strip()
+            
+            # Parse full resolution, or calculate missing dimensions
+            if w2_str and h2_str:
+                w2, h2 = int(w2_str), int(h2_str)
+            elif w2_str and not h2_str:
+                w2 = int(w2_str)
+                h2 = round((w2 * h1) / w1) # Cross-multiply to find height
+                print(f"\n> Auto-completed height based on aspect ratio: {w2}x{h2}")
+            elif not w2_str and h2_str:
+                h2 = int(h2_str)
+                w2 = round((h2 * w1) / h1) # Cross-multiply to find width
+                print(f"\n> Auto-completed width based on aspect ratio: {w2}x{h2}")
+            else:
+                print("\nError: You cannot just enter 'x'.")
+                return
             
             print("\nHow would you like to calculate the DPI for this new resolution?")
             print("1. Proportional (Keep UI elements the exact same size as they are now)")
@@ -76,7 +96,7 @@ def main():
             suggest_resolutions(w1, h1, dpi1)
             
     except ValueError:
-        print("\nError: Invalid input. Please use the format 'WidthxHeight' (e.g., 480x800) and standard numbers.")
+        print("\nError: Invalid input. Please ensure you are entering standard numbers.")
 
 if __name__ == "__main__":
     main()
