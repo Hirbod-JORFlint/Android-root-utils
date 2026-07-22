@@ -1,0 +1,6 @@
+id=propfusion
+name=PropFusion
+version=1.0.0
+versionCode=100
+author=Flint
+description=Applies optimized SurfaceFlinger and Stagefright properties at boot, then loads additional resetprop values from an external resetprop.conf file if present.
