@@ -1,20 +1,19 @@
 #!/system/bin/sh
 
-MODDIR=${0%/*}
-
-# Wait until Android is mostly booted.
+# Wait until Android has finished booting
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 2
 done
 
 sleep 5
 
+# Verify that this script actually ran
+resetprop persist.service.media_tweaks.loaded 1
+
 ########################################
 # Built-in tweaks
 ########################################
 
-
-#resetprop debug.stagefright.ccodec 1
 resetprop media.stagefright.thumbnail.prefer_hw_codecs false
 resetprop vendor.media.omx 0
 
@@ -27,46 +26,42 @@ resetprop media.stagefright.enable-qcp true
 resetprop media.stagefright.enable-scan true
 
 ########################################
-# External property file
+# Find external config
 ########################################
 
-PROPFILE=""
-
-for file in \
-    /data/local/resetprop.conf \
+for PROPFILE in \
+    /data/adb/resetprop.conf \
     /data/resetprop.conf \
-    /sdcard/resetprop.conf \
+    /data/local/tmp/resetprop.conf \
     /storage/emulated/0/resetprop.conf
 do
-    if [ -f "$file" ]; then
-        PROPFILE="$file"
-        break
-    fi
+    [ -r "$PROPFILE" ] && break
+    PROPFILE=""
 done
 
+########################################
+# Apply external config
+########################################
+
 if [ -n "$PROPFILE" ]; then
+    resetprop persist.service.media_tweaks.config "$PROPFILE"
+
     while IFS= read -r line || [ -n "$line" ]; do
 
-        # Remove whitespace
-        line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-        # Skip empty lines
-        [ -z "$line" ] && continue
-
-        # Skip comments
         case "$line" in
-            \#*) continue ;;
+            ""|\#*) continue ;;
         esac
 
-        # Skip malformed lines
-        case "$line" in
-            *=*)
-                prop="${line%%=*}"
-                value="${line#*=}"
+        line="${line%$'\r'}"
 
-                [ -n "$prop" ] && resetprop "$prop" "$value"
-                ;;
-        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+
+        [ "$key" = "$line" ] && continue
+
+        resetprop "$key" "$value"
 
     done < "$PROPFILE"
 fi
+
+resetprop persist.service.media_tweaks.done 1
