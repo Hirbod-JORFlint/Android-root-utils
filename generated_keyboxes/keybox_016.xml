@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <AndroidAttestation>
 <NumberOfKeyboxes>1</NumberOfKeyboxes>
-<Keybox DeviceID="Yurikey57. Valid keybox. Join my group: t.me/yuriiroot">
+<Keybox DeviceID="KB-DYI3M5UBX0PVDUI3">
 <Key algorithm="ecdsa">
 <PrivateKey format="pem">
 -----BEGIN EC PRIVATE KEY-----

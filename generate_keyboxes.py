@@ -1,395 +1,462 @@
 #!/usr/bin/env python3
 """
 Keybox Generator for TrickyStore
-Reads a keybox.xml and generates 50 unique keyboxes with different private keys.
+
+Takes a valid hardware keybox.xml and produces N ready-to-use copies for
+Strong Integrity. Cryptographic material (private keys + certificate chains)
+is preserved — that is required for Google attestation to succeed. Each
+output gets a unique DeviceID and normalized PEM/XML formatting.
+
+Usage:
+  python generate_keyboxes.py keybox.xml
+  python generate_keyboxes.py keybox.xml -n 50 -o keyboxes.zip
 """
 
-import os
-import sys
-import random
+from __future__ import annotations
+
+import argparse
+import hashlib
+import secrets
 import string
+import sys
 import zipfile
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
     from cryptography import x509
-    from cryptography.x509.oid import NameOID
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec, rsa
-    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
 except ImportError:
-    print("Error: 'cryptography' library is required.")
-    print("Install it with: pip install cryptography")
+    print("Error: 'cryptography' is required. Install with: pip install cryptography")
     sys.exit(1)
 
 
-def generate_random_device_id():
-    """Generate a random device ID string."""
-    prefix = "KB"
-    random_part = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
-    return f"{prefix}-{random_part}"
+GOOGLE_HW_ROOT_SN = "f92009e853b6b045"  # Google hardware attestation root
+AOSP_EC_ROOT_SN = "d8a08c7ddd303ab6"    # AOSP software EC root
+AOSP_RSA_ROOT_SN = "a2059ed10e435b57"   # AOSP software RSA root
 
 
-def generate_ec_keypair():
-    """Generate a new ECDSA P-256 key pair."""
-    private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
-    return private_key
+@dataclass
+class KeyMaterial:
+    algorithm: str
+    private_key_pem: str
+    certificates_pem: list[str]
 
 
-def generate_rsa_keypair():
-    """Generate a new RSA 2048-bit key pair."""
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
-    )
-    return private_key
+@dataclass
+class ParsedKeybox:
+    device_id: str
+    keys: dict[str, KeyMaterial] = field(default_factory=dict)
+
+    @property
+    def fingerprint(self) -> str:
+        """Stable hash of crypto material (ignores DeviceID)."""
+        h = hashlib.sha256()
+        for alg in sorted(self.keys):
+            km = self.keys[alg]
+            h.update(alg.encode())
+            h.update(km.private_key_pem.encode())
+            for cert in km.certificates_pem:
+                h.update(cert.encode())
+        return h.hexdigest()[:16]
 
 
-def create_leaf_certificate(issuer_cert_pem, subject_key, algorithm="ecdsa"):
-    """Create a new leaf certificate signed by the issuer certificate."""
-    # Parse the issuer certificate
-    issuer_cert = x509.load_pem_x509_certificate(issuer_cert_pem.encode(), default_backend())
-    
-    # Generate random serial number
-    serial = x509.random_serial_number()
-    
-    # Generate random subject components
-    org_unit = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    org = "TEE"
-    common_name = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
-    
-    # Create certificate subject
-    subject = issuer_cert.subject
-    
-    # Validity period - start from a random date in the past, valid for ~10 years
-    not_before = datetime.utcnow() - timedelta(days=random.randint(1, 365))
-    not_after = not_before + timedelta(days=3650)
-    
-    # Build the certificate
-    builder = x509.CertificateBuilder()
-    builder = builder.subject_name(subject)
-    builder = builder.issuer_name(issuer_cert.subject)
-    builder = builder.public_key(subject_key.public_key())
-    builder = builder.serial_number(serial)
-    builder = builder.not_valid_before(not_before)
-    builder = builder.not_valid_after(not_after)
-    
-    # Add Subject Alternative Name (SAN) with serial and other attributes
-    builder = builder.add_extension(
-        x509.SubjectAlternativeName([
-            x509.UniformResourceIdentifier(f"android:{common_name}"),
-        ]),
-        critical=False,
-    )
-    
-    # Add Basic Constraints
-    builder = builder.add_extension(
-        x509.BasicConstraints(ca=False, path_length=None),
-        critical=True,
-    )
-    
-    # Add Key Usage
-    builder = builder.add_extension(
-        x509.KeyUsage(
-            digital_signature=True,
-            key_encipherment=True,
-            content_commitment=False,
-            data_encipherment=False,
-            key_agreement=False,
-            key_cert_sign=False,
-            crl_sign=False,
-            encipher_only=False,
-            decipher_only=False,
-        ),
-        critical=True,
-    )
-    
-    # Add Extended Key Usage
-    builder = builder.add_extension(
-        x509.ExtendedKeyUsage([
-            x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
-            x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
-        ]),
-        critical=False,
-    )
-    
-    # Sign with the issuer's private key (using SHA256)
-    signed_cert = builder.sign(
-        private_key=issuer_cert.private_key if hasattr(issuer_cert, 'private_key') else None,
-        algorithm=hashes.SHA256(),
-        backend=default_backend()
-    )
-    
-    return signed_cert
+@dataclass
+class ValidationResult:
+    ok: bool
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    info: list[str] = field(default_factory=list)
 
 
-def create_self_signed_leaf_certificate(subject_key, algorithm="ecdsa"):
-    """Create a self-signed leaf certificate when issuer private key is unavailable."""
-    serial = x509.random_serial_number()
-    
-    org_unit = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-    common_name = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
-    
-    not_before = datetime.utcnow() - timedelta(days=random.randint(1, 365))
-    not_after = not_before + timedelta(days=3650)
-    
-    builder = x509.CertificateBuilder()
-    builder = builder.subject_name(x509.Name([
-        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, org_unit),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "TEE"),
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-    ]))
-    builder = builder.issuer_name(x509.Name([
-        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, org_unit),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "TEE"),
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-    ]))
-    builder = builder.public_key(subject_key.public_key())
-    builder = builder.serial_number(serial)
-    builder = builder.not_valid_before(not_before)
-    builder = builder.not_valid_after(not_after)
-    
-    builder = builder.add_extension(
-        x509.SubjectAlternativeName([
-            x509.UniformResourceIdentifier(f"android:{common_name}"),
-        ]),
-        critical=False,
-    )
-    
-    builder = builder.add_extension(
-        x509.BasicConstraints(ca=False, path_length=None),
-        critical=True,
-    )
-    
-    builder = builder.add_extension(
-        x509.KeyUsage(
-            digital_signature=True,
-            key_encipherment=True,
-            content_commitment=False,
-            data_encipherment=False,
-            key_agreement=False,
-            key_cert_sign=False,
-            crl_sign=False,
-            encipher_only=False,
-            decipher_only=False,
-        ),
-        critical=True,
-    )
-    
-    builder = builder.add_extension(
-        x509.ExtendedKeyUsage([
-            x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
-            x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
-        ]),
-        critical=False,
-    )
-    
-    signed_cert = builder.sign(
-        private_key=subject_key,
-        algorithm=hashes.SHA256(),
-        backend=default_backend()
-    )
-    
-    return signed_cert
+def _strip_pem(text: str | None) -> str:
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    return "\n".join(lines)
 
 
-def extract_certificates_from_pem(pem_data):
-    """Extract all certificates from a PEM string."""
-    certs = []
-    current_cert = []
-    in_cert = False
-    
-    for line in pem_data.split('\n'):
-        if '-----BEGIN CERTIFICATE-----' in line:
-            in_cert = True
-            current_cert = [line]
-        elif '-----END CERTIFICATE-----' in line:
-            current_cert.append(line)
-            certs.append('\n'.join(current_cert))
-            in_cert = False
-            current_cert = []
-        elif in_cert:
-            current_cert.append(line)
-    
-    return certs
+def _public_key_bytes(key) -> bytes:
+    return key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
 
 
-def parse_keybox(input_file):
-    """Parse the input keybox.xml file and extract key information."""
-    tree = ET.parse(input_file)
+def _load_private_key(pem: str):
+    return serialization.load_pem_private_key(pem.encode(), password=None)
+
+
+def _load_certificate(pem: str) -> x509.Certificate:
+    return x509.load_pem_x509_certificate(pem.encode())
+
+
+def _cert_expiry(cert: x509.Certificate) -> datetime:
+    # cryptography >= 42 uses *_utc; older builds use naive datetime attrs.
+    expiry = getattr(cert, "not_valid_after_utc", None)
+    if expiry is not None:
+        return expiry
+    return cert.not_valid_after.replace(tzinfo=timezone.utc)
+
+
+def _subject_serial(cert: x509.Certificate) -> str:
+    """Android attestation roots are identified by subject serialNumber DN."""
+    attrs = cert.subject.get_attributes_for_oid(x509.oid.NameOID.SERIAL_NUMBER)
+    if attrs:
+        return attrs[0].value.lower()
+    return format(cert.serial_number, "x")
+
+
+def _root_kind(cert: x509.Certificate) -> str:
+    sn = _subject_serial(cert)
+    if sn == GOOGLE_HW_ROOT_SN:
+        return "Google hardware"
+    if sn == AOSP_EC_ROOT_SN:
+        return "AOSP software (EC)"
+    if sn == AOSP_RSA_ROOT_SN:
+        return "AOSP software (RSA)"
+    return "Unknown"
+
+
+def _verify_cert_signed_by(child: x509.Certificate, parent: x509.Certificate) -> None:
+    pub = parent.public_key()
+    if isinstance(pub, rsa.RSAPublicKey):
+        pub.verify(
+            child.signature,
+            child.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            child.signature_hash_algorithm,
+        )
+    elif isinstance(pub, ec.EllipticCurvePublicKey):
+        pub.verify(
+            child.signature,
+            child.tbs_certificate_bytes,
+            ec.ECDSA(child.signature_hash_algorithm),
+        )
+    else:
+        raise TypeError(f"Unsupported issuer key type: {type(pub)}")
+
+
+def normalize_private_key_pem(pem: str) -> str:
+    """Re-export private key in traditional PEM form TrickyStore expects."""
+    key = _load_private_key(pem)
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        return key.private_bytes(
+            Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+        ).decode()
+    if isinstance(key, rsa.RSAPrivateKey):
+        return key.private_bytes(
+            Encoding.PEM, PrivateFormat.TraditionalOpenSSL, NoEncryption()
+        ).decode()
+    return key.private_bytes(
+        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+    ).decode()
+
+
+def normalize_certificate_pem(pem: str) -> str:
+    cert = _load_certificate(pem)
+    return cert.public_bytes(Encoding.PEM).decode()
+
+
+def generate_device_id(length: int = 16) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "KB-" + "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def parse_keybox(path: Path) -> ParsedKeybox:
+    tree = ET.parse(path)
     root = tree.getroot()
-    
-    keyboxes = []
-    
-    for keybox_elem in root.findall('Keybox'):
-        device_id = keybox_elem.get('DeviceID', 'Unknown')
-        
-        for key_elem in keybox_elem.findall('Key'):
-            algorithm = key_elem.get('algorithm', '').lower()
-            
-            private_key_elem = key_elem.find('PrivateKey')
-            private_key_pem = private_key_elem.text if private_key_elem is not None else None
-            
-            cert_chain_elem = key_elem.find('CertificateChain')
-            certs = []
-            if cert_chain_elem is not None:
-                for cert_elem in cert_chain_elem.findall('Certificate'):
-                    if cert_elem.text:
-                        certs.append(cert_elem.text.strip())
-            
-            keyboxes.append({
-                'algorithm': algorithm,
-                'private_key_pem': private_key_pem,
-                'certificate_chain': certs,
-                'device_id': device_id,
-            })
-    
-    return keyboxes
+
+    if root.tag != "AndroidAttestation":
+        raise ValueError(f"Unexpected root element: <{root.tag}>")
+
+    keybox_elem = root.find("Keybox")
+    if keybox_elem is None:
+        raise ValueError("No <Keybox> element found")
+
+    parsed = ParsedKeybox(device_id=keybox_elem.get("DeviceID", "Unknown"))
+
+    for key_elem in keybox_elem.findall("Key"):
+        algorithm = (key_elem.get("algorithm") or "").strip().lower()
+        if algorithm not in {"ecdsa", "rsa"}:
+            continue
+
+        private_key_pem = _strip_pem(
+            key_elem.findtext("PrivateKey")
+        )
+        chain_elem = key_elem.find("CertificateChain")
+        certs: list[str] = []
+        if chain_elem is not None:
+            for cert_elem in chain_elem.findall("Certificate"):
+                pem = _strip_pem(cert_elem.text)
+                if pem:
+                    certs.append(pem)
+
+        if not private_key_pem or not certs:
+            raise ValueError(f"Incomplete {algorithm} key material in keybox")
+
+        parsed.keys[algorithm] = KeyMaterial(
+            algorithm=algorithm,
+            private_key_pem=normalize_private_key_pem(private_key_pem),
+            certificates_pem=[normalize_certificate_pem(c) for c in certs],
+        )
+
+    if "ecdsa" not in parsed.keys and "rsa" not in parsed.keys:
+        raise ValueError("Keybox must contain at least one of ecdsa/rsa keys")
+
+    return parsed
 
 
-def generate_keybox_xml(device_id, ec_private_key, rsa_private_key, ec_certs, rsa_certs):
-    """Generate a complete keybox.xml string."""
-    ec_pem = ec_private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode()
-    
-    rsa_pem = rsa_private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode()
-    
-    ec_certs_xml = ""
-    for cert_pem in ec_certs:
-        ec_certs_xml += f"""<Certificate format="pem">
-{cert_pem}
-</Certificate>
-"""
-    
-    rsa_certs_xml = ""
-    for cert_pem in rsa_certs:
-        rsa_certs_xml += f"""<Certificate format="pem">
-{cert_pem}
-</Certificate>
-"""
-    
-    xml = f"""<?xml version="1.0"?>
-<AndroidAttestation>
-<NumberOfKeyboxes>1</NumberOfKeyboxes>
-<Keybox DeviceID="{device_id}">
-<Key algorithm="ecdsa">
-<PrivateKey format="pem">
-{ec_pem}</PrivateKey>
-<CertificateChain>
-<NumberOfCertificates>{len(ec_certs)}</NumberOfCertificates>
-{ec_certs_xml}</CertificateChain>
-</Key>
-<Key algorithm="rsa">
-<PrivateKey format="pem">
-{rsa_pem}</PrivateKey>
-<CertificateChain>
-<NumberOfCertificates>{len(rsa_certs)}</NumberOfCertificates>
-{rsa_certs_xml}</CertificateChain>
-</Key>
-</Keybox>
-</AndroidAttestation>"""
-    
-    return xml
+def validate_keybox(parsed: ParsedKeybox) -> ValidationResult:
+    result = ValidationResult(ok=True)
+    now = datetime.now(timezone.utc)
 
+    result.info.append(f"Source DeviceID: {parsed.device_id}")
+    result.info.append(f"Crypto fingerprint: {parsed.fingerprint}")
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python generate_keyboxes.py <input_keybox.xml> [output_count]")
-        print("  input_keybox.xml: Path to the source keybox.xml file")
-        print("  output_count: Number of keyboxes to generate (default: 50)")
-        sys.exit(1)
-    
-    input_file = sys.argv[1]
-    output_count = int(sys.argv[2]) if len(sys.argv) > 2 else 50
-    
-    if not os.path.exists(input_file):
-        print(f"Error: Input file '{input_file}' not found.")
-        sys.exit(1)
-    
-    print(f"[*] Parsing input keybox: {input_file}")
-    keyboxes = parse_keybox(input_file)
-    
-    if not keyboxes:
-        print("Error: No key data found in the input file.")
-        sys.exit(1)
-    
-    # Find EC and RSA key data
-    ec_data = None
-    rsa_data = None
-    
-    for kb in keyboxes:
-        if kb['algorithm'] == 'ecdsa':
-            ec_data = kb
-        elif kb['algorithm'] == 'rsa':
-            rsa_data = kb
-    
-    if not ec_data and not rsa_data:
-        print("Error: No ECDSA or RSA key data found.")
-        sys.exit(1)
-    
-    print(f"[*] Generating {output_count} unique keyboxes...")
-    
-    output_dir = Path("generated_keyboxes")
-    output_dir.mkdir(exist_ok=True)
-    
-    output_zip = Path("keyboxes.zip")
-    
-    with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for i in range(1, output_count + 1):
-            device_id = generate_random_device_id()
-            
-            # Generate new EC keypair
-            ec_private_key = generate_ec_keypair()
-            
-            # Generate new RSA keypair
-            rsa_private_key = generate_rsa_keypair()
-            
-            # Get the certificates from the original keybox
-            # We preserve the full certificate chain for TrickyStore compatibility
-            # TrickyStore patches the TEE to bypass key attestation, so it doesn't
-            # verify that the private key matches the certificate's public key
-            
-            ec_certs = ec_data['certificate_chain'] if ec_data else []
-            rsa_certs = rsa_data['certificate_chain'] if rsa_data else []
-            
-            # Generate the XML
-            xml_content = generate_keybox_xml(
-                device_id,
-                ec_private_key,
-                rsa_private_key,
-                ec_certs,
-                rsa_certs
+    for alg, km in parsed.keys.items():
+        try:
+            priv = _load_private_key(km.private_key_pem)
+            leaf = _load_certificate(km.certificates_pem[0])
+        except Exception as exc:
+            result.ok = False
+            result.errors.append(f"[{alg}] Failed to parse key/cert: {exc}")
+            continue
+
+        if _public_key_bytes(priv.public_key()) != _public_key_bytes(leaf.public_key()):
+            result.ok = False
+            result.errors.append(
+                f"[{alg}] Private key does NOT match leaf certificate "
+                "(Strong Integrity would fail)"
             )
-            
-            # Write to zip
+        else:
+            result.info.append(f"[{alg}] Private key matches leaf certificate")
+
+        # Chain signatures
+        for i in range(len(km.certificates_pem) - 1):
+            child = _load_certificate(km.certificates_pem[i])
+            parent = _load_certificate(km.certificates_pem[i + 1])
+            try:
+                _verify_cert_signed_by(child, parent)
+                result.info.append(f"[{alg}] Chain link {i} -> {i + 1} valid")
+            except Exception as exc:
+                result.ok = False
+                result.errors.append(f"[{alg}] Chain link {i} -> {i + 1} invalid: {exc}")
+
+        expiry = _cert_expiry(leaf)
+        if expiry <= now:
+            result.ok = False
+            result.errors.append(f"[{alg}] Leaf certificate expired on {expiry.date()}")
+        else:
+            result.info.append(f"[{alg}] Leaf valid until {expiry.date()}")
+
+        root = _load_certificate(km.certificates_pem[-1])
+        kind = _root_kind(root)
+        result.info.append(f"[{alg}] Root: {kind} (SN {_subject_serial(root)})")
+        if "AOSP" in kind:
+            result.warnings.append(
+                f"[{alg}] AOSP software root detected - typically DEVICE only, not Strong"
+            )
+        elif kind == "Unknown":
+            result.warnings.append(
+                f"[{alg}] Unknown attestation root - Strong Integrity may fail"
+            )
+
+        if len(km.certificates_pem) < 2:
+            result.warnings.append(f"[{alg}] Certificate chain is unusually short")
+
+    if "ecdsa" not in parsed.keys:
+        result.warnings.append("Missing ECDSA key — some apps prefer EC attestation")
+    if "rsa" not in parsed.keys:
+        result.warnings.append("Missing RSA key — some apps prefer RSA attestation")
+
+    return result
+
+
+def build_keybox_xml(device_id: str, keys: dict[str, KeyMaterial]) -> str:
+    """Build a TrickyStore-compatible keybox.xml string."""
+    # Preserve a stable algorithm order: ecdsa then rsa (common convention).
+    ordered = [alg for alg in ("ecdsa", "rsa") if alg in keys]
+
+    lines = [
+        '<?xml version="1.0"?>',
+        "<AndroidAttestation>",
+        "<NumberOfKeyboxes>1</NumberOfKeyboxes>",
+        f'<Keybox DeviceID="{_xml_escape(device_id)}">',
+    ]
+
+    for alg in ordered:
+        km = keys[alg]
+        lines.append(f'<Key algorithm="{alg}">')
+        lines.append('<PrivateKey format="pem">')
+        lines.append(km.private_key_pem.rstrip())
+        lines.append("</PrivateKey>")
+        lines.append("<CertificateChain>")
+        lines.append(f"<NumberOfCertificates>{len(km.certificates_pem)}</NumberOfCertificates>")
+        for cert_pem in km.certificates_pem:
+            lines.append('<Certificate format="pem">')
+            lines.append(cert_pem.rstrip())
+            lines.append("</Certificate>")
+        lines.append("</CertificateChain>")
+        lines.append("</Key>")
+
+    lines.append("</Keybox>")
+    lines.append("</AndroidAttestation>")
+    lines.append("")  # trailing newline
+    return "\n".join(lines)
+
+
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def generate_outputs(
+    parsed: ParsedKeybox,
+    count: int,
+    zip_path: Path,
+    also_dir: Path | None,
+) -> list[str]:
+    used_ids: set[str] = set()
+    filenames: list[str] = []
+
+    if also_dir is not None:
+        also_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i in range(1, count + 1):
+            device_id = generate_device_id()
+            while device_id in used_ids:
+                device_id = generate_device_id()
+            used_ids.add(device_id)
+
+            xml_content = build_keybox_xml(device_id, parsed.keys)
             filename = f"keybox_{i:03d}.xml"
             zf.writestr(filename, xml_content)
-            
-            # Also save individual file
-            filepath = output_dir / filename
-            with open(filepath, 'w') as f:
-                f.write(xml_content)
-            
-            if i % 10 == 0 or i == output_count:
-                print(f"  [+] Generated {i}/{output_count} keyboxes")
-    
-    print(f"\n[+] Done! Generated {output_count} keyboxes.")
-    print(f"[+] ZIP archive: {output_zip.absolute()}")
-    print(f"[+] Individual files: {output_dir.absolute()}/")
-    print(f"\n[+] Note: Each keybox contains unique ECDSA and RSA private keys.")
-    print("[*] Certificate chains are preserved from the original keybox.")
-    print("[*] TrickyStore patches TEE to bypass key attestation checks.")
+            filenames.append(filename)
+
+            if also_dir is not None:
+                with open(also_dir / filename, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(xml_content)
+
+            if i % 10 == 0 or i == count:
+                print(f"  [+] {i}/{count}")
+
+    return filenames
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate N usable TrickyStore keyboxes from a valid hardware keybox.xml. "
+            "Private keys and certificate chains are preserved (required for Strong Integrity); "
+            "each output gets a unique DeviceID."
+        )
+    )
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="Path to source keybox.xml",
+    )
+    parser.add_argument(
+        "-n", "--count",
+        type=int,
+        default=50,
+        help="Number of keyboxes to generate (default: 50)",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=Path,
+        default=Path("keyboxes.zip"),
+        help="Output ZIP path (default: keyboxes.zip)",
+    )
+    parser.add_argument(
+        "--also-dir",
+        type=Path,
+        default=Path("generated_keyboxes"),
+        help="Also write individual XML files to this directory "
+             "(default: generated_keyboxes). Use '' to disable.",
+    )
+    parser.add_argument(
+        "--skip-validate",
+        action="store_true",
+        help="Skip cryptographic validation of the source keybox",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    if args.count < 1:
+        print("Error: --count must be >= 1")
+        return 1
+
+    if not args.input.is_file():
+        print(f"Error: input file not found: {args.input}")
+        return 1
+
+    also_dir: Path | None
+    if str(args.also_dir) in {"", "none", "None"}:
+        also_dir = None
+    else:
+        also_dir = args.also_dir
+
+    print(f"[*] Parsing {args.input}")
+    try:
+        parsed = parse_keybox(args.input)
+    except Exception as exc:
+        print(f"Error: failed to parse keybox: {exc}")
+        return 1
+
+    print(f"[*] Found algorithms: {', '.join(sorted(parsed.keys))}")
+
+    if not args.skip_validate:
+        print("[*] Validating cryptographic material...")
+        validation = validate_keybox(parsed)
+        for line in validation.info:
+            print(f"    - {line}")
+        for line in validation.warnings:
+            print(f"  [!] {line}")
+        for line in validation.errors:
+            print(f"  [x] {line}")
+        if not validation.ok:
+            print(
+                "\nError: source keybox failed validation. "
+                "Refusing to generate broken copies. "
+                "Use --skip-validate to override (not recommended)."
+            )
+            return 1
+        print("[+] Source keybox looks usable for Strong Integrity (if unrevoked)")
+    else:
+        print("[!] Validation skipped")
+
+    print(f"[*] Generating {args.count} keyboxes -> {args.output}")
+    generate_outputs(parsed, args.count, args.output, also_dir)
+
+    print(f"\n[+] Done. Wrote {args.count} keyboxes to {args.output.resolve()}")
+    if also_dir is not None:
+        print(f"[+] Individual files in {also_dir.resolve()}")
+    print(
+        "[*] Note: outputs share the same attestation keys/certs as the source "
+        "(required for Strong). Only DeviceID differs per file."
+    )
+    print(
+        "[*] Revocation is enforced by Google - a revoked source keybox "
+        "cannot be made valid by regenerating copies."
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
