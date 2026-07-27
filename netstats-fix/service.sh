@@ -40,7 +40,11 @@ BPF_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
 
 log "--- Phase 1: Diagnostics ---"
 log "Kernel: $(uname -r 2>/dev/null)"
-log "BPF JIT: $(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo N/A)"
+if [ -f /proc/sys/net/core/bpf_jit_enable ]; then
+    log "BPF JIT: $(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null)"
+else
+    log "BPF JIT: not available (file /proc/sys/net/core/bpf_jit_enable missing)"
+fi
 
 # Check BPF maps
 BPF_STATS_OK=0
@@ -122,27 +126,57 @@ if [ -d /proc/uid_stat ]; then
 fi
 
 # ---- Capture BPF-related dmesg ----
-log "BPF-related kernel messages:"
-dmesg | grep -iE 'bpf|cgroup_skb|netd.*map|bpfloader|verifier' 2>/dev/null | tail -20 >> "$LOG"
+DMESG_RESTRICT=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)
+log "dmesg_restrict: ${DMESG_RESTRICT:-unknown}"
+BPF_DMESG=$(dmesg 2>/dev/null | grep -iE 'bpf|cgroup_skb|netd.*map|bpfloader|verifier|netbpfload|BpfLoader' 2>/dev/null | tail -20)
+if [ -n "$BPF_DMESG" ]; then
+    log "BPF-related kernel messages (dmesg):"
+    echo "$BPF_DMESG" >> "$LOG"
+else
+    log "BPF-related kernel messages: (dmesg empty or restricted)"
+fi
+
+# ---- Fallback: logcat for BPF messages when dmesg is empty ----
+# On some devices dmesg is restricted or cleared before service.sh runs.
+# logcat retains init/kernel messages longer.
+if [ -z "$BPF_DMESG" ]; then
+    LOGCAT_BPF=$(logcat -d -b kernel,main -s bpfloader:* netbpfload:* BpfLoader:* NetBpfLoad:* 2>/dev/null | tail -20)
+    if [ -n "$LOGCAT_BPF" ]; then
+        log "BPF-related logcat messages:"
+        echo "$LOGCAT_BPF" >> "$LOG"
+    fi
+    # Also try logcat with tag filter
+    LOGCAT_BPF2=$(logcat -d -b all 2>/dev/null | grep -iE 'bpf|netbpfload|BpfLoader|cgroup_skb' 2>/dev/null | tail -15)
+    if [ -n "$LOGCAT_BPF2" ]; then
+        log "BPF logcat (grep):"
+        echo "$LOGCAT_BPF2" >> "$LOG"
+    fi
+fi
 
 # ---- Capture netbpfload exit status from dmesg ----
-NBPFP_STATUS=$(dmesg | grep -i 'netbpfload\|NetBpfLoad' 2>/dev/null | tail -5)
+NBPFP_STATUS=$(dmesg 2>/dev/null | grep -i 'netbpfload\|NetBpfLoad' 2>/dev/null | tail -5)
 if [ -n "$NBPFP_STATUS" ]; then
     log "netbpfload dmesg output:"
     echo "$NBPFP_STATUS" >> "$LOG"
-    # Check if it reported success but maps are still missing
     if echo "$NBPFP_STATUS" | grep -qi 'success'; then
         log "  netbpfload reported success but network maps missing (kernel too old)"
     fi
 fi
 # Also capture bpfloader errors
-BPFLOADER_ERRS=$(dmesg | grep -i 'BpfLoader-rs\|bpfloader.*error\|bpfloader.*fail' 2>/dev/null | tail -10)
+BPFLOADER_ERRS=$(dmesg 2>/dev/null | grep -i 'BpfLoader-rs\|bpfloader.*error\|bpfloader.*fail' 2>/dev/null | tail -10)
+if [ -z "$BPFLOADER_ERRS" ]; then
+    # Try logcat fallback
+    BPFLOADER_ERRS=$(logcat -d -b all 2>/dev/null | grep -i 'BpfLoader-rs\|bpfloader.*error\|bpfloader.*fail' 2>/dev/null | tail -10)
+fi
 if [ -n "$BPFLOADER_ERRS" ]; then
     log "bpfloader errors:"
     echo "$BPFLOADER_ERRS" >> "$LOG"
 fi
 # Capture SELinux denials for bpfloader
-BPF_AVCS=$(dmesg | grep -i 'avc.*denied.*bpfloader\|avc.*denied.*bpf' 2>/dev/null | tail -5)
+BPF_AVCS=$(dmesg 2>/dev/null | grep -i 'avc.*denied.*bpfloader\|avc.*denied.*bpf' 2>/dev/null | tail -5)
+if [ -z "$BPF_AVCS" ]; then
+    BPF_AVCS=$(logcat -d -b all 2>/dev/null | grep -i 'avc.*denied.*bpfloader\|avc.*denied.*bpf' 2>/dev/null | tail -5)
+fi
 if [ -n "$BPF_AVCS" ]; then
     log "SELinux denials for bpfloader:"
     echo "$BPF_AVCS" >> "$LOG"
@@ -178,37 +212,44 @@ if [ "$BPF_STATS_OK" -eq 0 ]; then
     fi
 
     # ---- Repair 2: Try setting ro.bpf.kver_override if missing ----
-    # Some GSIs need this property for netbpfload to pass its version check
+    # Some GSIs need this property for netbpfload to pass its version check.
+    # Only useful on kernels >= 5.0 that may have BPF but need the version
+    # override to pass netbpfload's compatibility check. On kernels < 5.0,
+    # setting this to the actual old version is counterproductive.
     if [ "$BPF_STATS_OK" -eq 0 ] && [ "$APEX_OK" -eq 1 ]; then
         CURRENT_KVER=$(uname -r | grep -oE '[0-9]+\.[0-9]+')
+        CUR_KMAJOR=$(echo "$CURRENT_KVER" | cut -d. -f1)
         log "Repair 2: Checking ro.bpf.kver_override..."
         CUR_KVER_PROP=$(getprop ro.bpf.kver_override 2>/dev/null)
         log "  Current: ${CUR_KVER_PROP:-not set}"
 
         if [ -z "$CUR_KVER_PROP" ]; then
-            # Try setting it to the actual kernel version
-            KVER_NUMS=$(echo "$CURRENT_KVER" | tr -d '.')
-            if command -v resetprop_phh >/dev/null 2>&1; then
-                resetprop_phh ro.bpf.kver_override "$CURRENT_KVER" 2>/dev/null
-                log "  Set to $CURRENT_KVER via resetprop_phh"
-            elif command -v magisk >/dev/null 2>&1; then
-                magisk resetprop ro.bpf.kver_override "$CURRENT_KVER" 2>/dev/null
-                log "  Set to $CURRENT_KVER via magisk resetprop"
-            fi
-            # Retry bpfloader with new property
-            stop bpfloader 2>/dev/null
-            sleep 1
-            start bpfloader 2>/dev/null
-            sleep 8
+            if [ "$CUR_KMAJOR" -ge 5 ]; then
+                # Kernel >= 5.0: setting override may help netbpfload pass its check
+                if command -v resetprop_phh >/dev/null 2>&1; then
+                    resetprop_phh ro.bpf.kver_override "$CURRENT_KVER" 2>/dev/null
+                    log "  Set to $CURRENT_KVER via resetprop_phh (kernel >= 5.0)"
+                elif command -v magisk >/dev/null 2>&1; then
+                    magisk resetprop ro.bpf.kver_override "$CURRENT_KVER" 2>/dev/null
+                    log "  Set to $CURRENT_KVER via magisk resetprop (kernel >= 5.0)"
+                fi
+                # Retry bpfloader with new property
+                stop bpfloader 2>/dev/null
+                sleep 1
+                start bpfloader 2>/dev/null
+                sleep 8
 
-            if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-                BPF_STATS_OK=1
-                log "Repair 2 SUCCESS: BPF maps present after kver_override fix"
+                if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
+                    BPF_STATS_OK=1
+                    log "Repair 2 SUCCESS: BPF maps present after kver_override fix"
+                else
+                    log "Repair 2: BPF maps still missing"
+                fi
             else
-                log "Repair 2: BPF maps still missing"
+                log "  Kernel < 5.0: NOT setting kver_override (would be counterproductive)"
             fi
         else
-            log "  Already set, skipping"
+            log "  Already set ($CUR_KVER_PROP), skipping"
         fi
     fi
 
