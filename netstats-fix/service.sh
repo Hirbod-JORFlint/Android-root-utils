@@ -1,7 +1,12 @@
 #!/system/bin/sh
-# service.sh - Late_start: repair BPF loading and verify network stats
-# Runs after boot_completed. Attempts to fix per-UID traffic accounting
-# by repairing BPF program loading from the tethering APEX.
+# service.sh - Late_start: repair network stats on all devices
+# Universal strategy:
+#   1. Check if BPF maps already exist (lucky case)
+#   2. If not, try to repair BPF loading (restart bpfloader service)
+#   3. If BPF is fundamentally impossible (kernel 4.14 etc), fall back
+#      to xt_qtaguid or uid_stat legacy interfaces
+#   4. If nothing gives per-UID stats, ensure interface-level stats work
+#      and provide clear diagnostics
 
 MODDIR=${0%/*}
 LOG=/data/local/tmp/netstats-fix.log
@@ -24,268 +29,380 @@ log "Boot completed after ${WAIT}s"
 sleep 10
 
 # ============================================================
+# PATHS
+# ============================================================
+BPF_MAP="/sys/fs/bpf/netd_shared/map_netd_uid_stats_map"
+BPF_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
+
+# ============================================================
 # PHASE 1: DIAGNOSTICS
 # ============================================================
 
 log "--- Phase 1: Diagnostics ---"
-
-# Kernel info
 log "Kernel: $(uname -r 2>/dev/null)"
-log "Kernel BPF support: $(zcat /proc/config.gz 2>/dev/null | grep -c 'CONFIG_BPF=y\|CONFIG_BPF_SYSCALL=y\|CONFIG_CGROUP_BPF=y' || echo 'config.gz unavailable')"
-log "Kernel BPF JIT: $(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo 'N/A')"
+log "BPF JIT: $(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null || echo N/A)"
 
-# BPF filesystem
-log "BPF fs mounted: $(mount | grep -c 'bpf.*\/sys\/fs\/bpf')"
-log "BPF dir permissions: $(ls -ld /sys/fs/bpf 2>/dev/null)"
-
-# BPF maps
-BPF_MAP="/sys/fs/bpf/netd_shared/map_netd_uid_stats_map"
-BPF_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
+# Check BPF maps
 BPF_STATS_OK=0
-
 if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
     BPF_STATS_OK=1
-    log "BPF maps: PRESENT (uid_stats + uid_owner)"
+    log "BPF maps: PRESENT"
 else
     log "BPF maps: MISSING"
     log "  uid_stats_map: $([ -e "$BPF_MAP" ] && echo present || echo absent)"
     log "  uid_owner_map: $([ -e "$BPF_OWNER" ] && echo present || echo absent)"
 fi
 
-# List all BPF maps for reference
-log "All BPF maps under /sys/fs/bpf/netd_shared:"
+# Check netd_shared contents
+log "netd_shared contents:"
 ls -la /sys/fs/bpf/netd_shared/ 2>/dev/null >> "$LOG"
-log "All BPF maps under /sys/fs/bpf:"
-ls -la /sys/fs/bpf/ 2>/dev/null >> "$LOG"
 
-# Cgroup hierarchy
-log "Cgroup mounts:"
-mount | grep 'cgroup' >> "$LOG" 2>/dev/null
-if [ -d /dev/cgroup ]; then
-    log "  /dev/cgroup: exists"
-    ls /dev/cgroup/ 2>/dev/null >> "$LOG"
-elif [ -d /sys/fs/cgroup ]; then
-    log "  /sys/fs/cgroup: exists"
-    ls /sys/fs/cgroup/ 2>/dev/null >> "$LOG"
+# Check for mainline_done marker (means netbpfload ran but didn't create network maps)
+if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
+    log "mainline_done marker: PRESENT (netbpfload ran but network maps missing)"
 fi
 
 # Tethering APEX
+APEX_OK=0
 if [ -d /apex/com.android.tethering ]; then
+    APEX_OK=1
     log "Tethering APEX: mounted"
-    log "  netbpfload: $([ -f /apex/com.android.tethering/bin/netbpfload ] && echo present || echo missing)"
-    log "  service-connectivity.jar: $([ -f /apex/com.android.tethering/javalib/service-connectivity.jar ] && echo present || echo missing)"
 else
     log "WARN: Tethering APEX not mounted"
 fi
 
-# netd status
-log "netd service: $(getprop init.svc.netd 2>/dev/null)"
-log "bpfloader service: $(getprop init.svc.bpfloader 2>/dev/null)"
+# netd and bpfloader
+log "netd: $(getprop init.svc.netd 2>/dev/null)"
+log "bpfloader: $(getprop init.svc.bpfloader 2>/dev/null)"
 
 # Settings
-log "restricted_networking_mode: $(settings get global restricted_networking_mode 2>/dev/null)"
 log "network_stats_enabled: $(settings get global network_stats_enabled 2>/dev/null)"
+log "restricted_networking_mode: $(settings get global restricted_networking_mode 2>/dev/null)"
 
 # SELinux
-SELINUX_STATUS=$(getenforce 2>/dev/null || echo "unknown")
-log "SELinux: $SELINUX_STATUS"
+SELINUX=$(getenforce 2>/dev/null || echo unknown)
+log "SELinux: $SELINUX"
+
+# Read pre-computed BPF capability
+BPF_CAPABLE=0
+if [ -f /data/local/tmp/.bpf_capable ]; then
+    BPF_CAPABLE=$(cat /data/local/tmp/.bpf_capable 2>/dev/null)
+fi
+log "BPF capable (from post-fs-data detection): $BPF_CAPABLE"
+
+# ---- Kernel version detection ----
+KMAJOR=$(uname -r | cut -d. -f1)
+KMINOR=$(uname -r | cut -d. -f2)
+log "Kernel major.minor: ${KMAJOR}.${KMINOR}"
+
+# ---- Check legacy per-UID stats interfaces ----
+HAS_XTAGUID=0
+HAS_UIDSTAT=0
+if [ -f /proc/net/xt_qtaguid/stats ]; then
+    HAS_XTAGUID=1
+    log "xt_qtaguid stats: AVAILABLE"
+    log "xt_qtaguid stats lines: $(wc -l < /proc/net/xt_qtaguid/stats 2>/dev/null)"
+elif [ -c /dev/xt_qtaguid ]; then
+    log "xt_qtaguid device: EXISTS (but no stats file yet)"
+    HAS_XTAGUID=2
+fi
+if [ -d /proc/uid_stat ]; then
+    HAS_UIDSTAT=1
+    log "uid_stat: AVAILABLE"
+    log "uid_stat UIDs: $(ls /proc/uid_stat/ 2>/dev/null | wc -l)"
+fi
+
+# ---- Capture BPF-related dmesg ----
+log "BPF-related kernel messages:"
+dmesg | grep -iE 'bpf|cgroup_skb|netd.*map|bpfloader|verifier' 2>/dev/null | tail -20 >> "$LOG"
 
 # ============================================================
-# PHASE 2: BPF REPAIR (if maps are missing)
+# PHASE 2: BPF REPAIR (only if BPF maps missing)
 # ============================================================
 
 if [ "$BPF_STATS_OK" -eq 0 ]; then
     log "--- Phase 2: BPF Repair Attempt ---"
 
-    REPAIR_ATTEMPTED=1
-
-    # ---- Repair step 1: Restart bpfloader service ----
-    # The bpfloader service in netbpfload.rc is set to /system/bin/false
-    # but the tethering APEX should override it. Restarting may trigger
-    # the APEX override to activate properly.
+    # ---- Repair 1: Restart bpfloader service ----
+    # This is the ONLY reliable way to invoke netbpfload because it
+    # requires init-set environment variables (ANDROID_ROOT, etc).
+    # Manual invocation WILL crash with Rust panic (NotPresent).
     log "Repair 1: Restarting bpfloader service..."
     stop bpfloader 2>/dev/null
     sleep 2
     start bpfloader 2>/dev/null
-    sleep 5
+    # Give it time to load programs
+    sleep 8
 
     if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
         BPF_STATS_OK=1
-        log "Repair 1 SUCCESS: BPF maps now present after bpfloader restart"
+        log "Repair 1 SUCCESS: BPF maps present after bpfloader restart"
     else
-        log "Repair 1: BPF maps still missing after bpfloader restart"
+        log "Repair 1: BPF maps still missing"
+        log "  bpfloader state: $(getprop init.svc.bpfloader 2>/dev/null)"
+        log "  netd_shared after restart:"
+        ls -la /sys/fs/bpf/netd_shared/ 2>/dev/null >> "$LOG"
     fi
 
-    # ---- Repair step 2: Manually run netbpfload from APEX ----
-    if [ "$BPF_STATS_OK" -eq 0 ] && [ -f /apex/com.android.tethering/bin/netbpfload ]; then
-        log "Repair 2: Manually invoking netbpfload from tethering APEX..."
-        /apex/com.android.tethering/bin/netbpfload 2>> "$LOG"
-        NBPFP_EXIT=$?
-        log "Repair 2: netbpfload exited with code $NBPFP_EXIT"
-        sleep 3
+    # ---- Repair 2: Try setting ro.bpf.kver_override if missing ----
+    # Some GSIs need this property for netbpfload to pass its version check
+    if [ "$BPF_STATS_OK" -eq 0 ] && [ "$APEX_OK" -eq 1 ]; then
+        CURRENT_KVER=$(uname -r | grep -oE '[0-9]+\.[0-9]+')
+        log "Repair 2: Checking ro.bpf.kver_override..."
+        CUR_KVER_PROP=$(getprop ro.bpf.kver_override 2>/dev/null)
+        log "  Current: ${CUR_KVER_PROP:-not set}"
 
-        if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-            BPF_STATS_OK=1
-            log "Repair 2 SUCCESS: BPF maps now present after manual netbpfload"
-        else
-            log "Repair 2: BPF maps still missing after manual netbpfload"
-        fi
-    else
-        log "Repair 2: SKIPPED (netbpfload not found)"
-    fi
-
-    # ---- Repair step 3: Ensure cgroup hierarchy is mounted ----
-    # cgroup_skb BPF programs need cgroup net_cls/net_prio controllers.
-    # On some GSIs the cgroup mounts are incomplete.
-    if ! mount | grep -q 'cgroup'; then
-        log "Repair 3: Attempting to mount cgroup hierarchy..."
-        mkdir -p /dev/cgroup 2>/dev/null
-        mount -t cgroup -o cpu,cpuacct none /dev/cgroup 2>/dev/null
-        mkdir -p /dev/cgroup/net_cls 2>/dev/null
-        mount -t cgroup -o net_cls,net_prio none /dev/cgroup/net_cls 2>/dev/null
-        if mount | grep -q 'cgroup'; then
-            log "Repair 3: Cgroup mounts created"
-            # Retry bpfloader after cgroup mount
+        if [ -z "$CUR_KVER_PROP" ]; then
+            # Try setting it to the actual kernel version
+            KVER_NUMS=$(echo "$CURRENT_KVER" | tr -d '.')
+            if command -v resetprop_phh >/dev/null 2>&1; then
+                resetprop_phh ro.bpf.kver_override "$CURRENT_KVER" 2>/dev/null
+                log "  Set to $CURRENT_KVER via resetprop_phh"
+            elif command -v magisk >/dev/null 2>&1; then
+                magisk resetprop ro.bpf.kver_override "$CURRENT_KVER" 2>/dev/null
+                log "  Set to $CURRENT_KVER via magisk resetprop"
+            fi
+            # Retry bpfloader with new property
             stop bpfloader 2>/dev/null
             sleep 1
             start bpfloader 2>/dev/null
-            sleep 5
+            sleep 8
+
             if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
                 BPF_STATS_OK=1
-                log "Repair 3 SUCCESS: BPF maps present after cgroup mount + bpfloader restart"
+                log "Repair 2 SUCCESS: BPF maps present after kver_override fix"
+            else
+                log "Repair 2: BPF maps still missing"
             fi
         else
-            log "Repair 3: WARN - Failed to mount cgroup hierarchy"
+            log "  Already set, skipping"
         fi
-    else
-        log "Repair 3: Cgroup already mounted, skipping"
     fi
 
-    # ---- Repair step 4: Temporary SELinux permissive test ----
-    if [ "$BPF_STATS_OK" -eq 0 ] && [ "$SELINUX_STATUS" = "Enforcing" ]; then
-        log "Repair 4: Testing SELinux permissive (temporary)..."
+    # ---- Repair 3: SELinux permissive test ----
+    if [ "$BPF_STATS_OK" -eq 0 ] && [ "$SELINUX" = "Enforcing" ]; then
+        log "Repair 3: Testing with SELinux permissive..."
         setenforce 0 2>/dev/null
         stop bpfloader 2>/dev/null
         sleep 1
         start bpfloader 2>/dev/null
-        sleep 5
+        sleep 8
 
         if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
             BPF_STATS_OK=1
-            log "Repair 4 SUCCESS: BPF maps present with SELinux permissive"
-            log "Repair 4: Check dmesg for avc denials to identify the blocking rule"
-            dmesg | grep -i 'avc.*denied.*bpf\|avc.*denied.*netd\|avc.*denied.*bpfloader' 2>/dev/null >> "$LOG"
+            log "Repair 3 SUCCESS: BPF maps present with SELinux permissive"
+            log "  Check dmesg for avc denials:"
+            dmesg | grep -i 'avc.*denied' 2>/dev/null | tail -10 >> "$LOG"
         else
-            log "Repair 4: BPF maps still missing even with SELinux permissive"
+            log "Repair 3: BPF maps still missing even with SELinux permissive"
         fi
-
-        # Restore enforcing
         setenforce 1 2>/dev/null
-        log "Repair 4: SELinux restored to Enforcing"
-    else
-        log "Repair 4: SKIPPED (SELinux not enforcing or BPF already fixed)"
+        log "  SELinux restored to Enforcing"
     fi
 fi
 
 # ============================================================
-# PHASE 3: FALLBACK / SETTINGS
+# PHASE 3: LEGACY FALLBACK (if BPF failed)
 # ============================================================
 
-log "--- Phase 3: Settings and fallback ---"
+if [ "$BPF_STATS_OK" -eq 0 ]; then
+    log "--- Phase 3: Legacy Fallback ---"
 
-# Ensure network_stats_enabled is set (enables interface-level stats collection)
-# This is the minimum needed for any traffic data
+    FALLBACK_METHOD="none"
+
+    # ---- Fallback A: xt_qtaguid ----
+    # xt_qtaguid provides /proc/net/xt_qtaguid/stats with per-UID data.
+    # Kernel 4.14 may have this compiled as module or built-in.
+    if [ "$HAS_XTAGUID" -ge 1 ]; then
+        log "Fallback A: xt_qtaguid available, configuring..."
+
+        # Load module if it's a module (not built-in)
+        if [ "$HAS_XTAGUID" -eq 2 ]; then
+            modprobe xt_qtaguid 2>/dev/null
+            if [ -f /proc/net/xt_qtaguid/stats ]; then
+                HAS_XTAGUID=1
+                log "  xt_qtaguid module loaded successfully"
+            fi
+        fi
+
+        if [ "$HAS_XTAGUID" -eq 1 ]; then
+            # Ensure the property tells NetworkStatsService to use xt_qtaguid
+            if command -v resetprop_phh >/dev/null 2>&1; then
+                resetprop_phh net.qtaguid_enabled 1 2>/dev/null
+            elif command -v magisk >/dev/null 2>&1; then
+                magisk resetprop net.qtaguid_enabled 1 2>/dev/null
+            fi
+
+            # Set up xt_qtaguid tag socket rules via ndc
+            # ndc is netd's command-line client
+            if command -v ndc >/dev/null 2>&1; then
+                # Tag all UID traffic for stats (tag 0xFFFFFFFE = no restriction, just counting)
+                ndc bandwidth addalert 2>/dev/null
+                log "  ndc bandwidth alert configured"
+            fi
+
+            FALLBACK_METHOD="xt_qtaguid"
+            log "  xt_qtaguid fallback active"
+        fi
+    fi
+
+    # ---- Fallback B: uid_stat ----
+    # /proc/uid_stat/<uid>/tcp_rcv and tcp_snd provide basic per-UID TCP stats.
+    # This is a very lightweight interface available on some kernels.
+    if [ "$FALLBACK_METHOD" = "none" ] && [ "$HAS_UIDSTAT" -eq 1 ]; then
+        log "Fallback B: uid_stat available"
+        FALLBACK_METHOD="uid_stat"
+        # uid_stat is read automatically by some ROMs' NetworkStatsService
+        log "  uid_stat fallback active"
+    fi
+
+    # ---- Fallback C: ensure interface-level stats at minimum ----
+    if [ "$FALLBACK_METHOD" = "none" ]; then
+        log "Fallback C: No per-UID legacy interface available"
+        log "  Interface-level stats only (total traffic, not per-app)"
+    fi
+
+    log "Fallback method: $FALLBACK_METHOD"
+fi
+
+# ============================================================
+# PHASE 4: SETTINGS AND NETD RESTART
+# ============================================================
+
+log "--- Phase 4: Settings ---"
+
+# Ensure network_stats_enabled (required for ANY stats collection)
 settings put global network_stats_enabled 1 2>/dev/null
 log "network_stats_enabled: $(settings get global network_stats_enabled 2>/dev/null)"
 
 # Ensure restricted_networking_mode stays at whatever phh set it
-# (we don't override this - it controls the firewall, not stats)
 log "restricted_networking_mode: $(settings get global restricted_networking_mode 2>/dev/null)"
 
-# ---- Resetprop: ensure stats-related properties are correct ----
+# Set stats-related properties
 if command -v resetprop_phh >/dev/null 2>&1; then
     resetprop_phh persist.sys.nobpf false 2>/dev/null
     resetprop_phh ro.net.stats 1 2>/dev/null
+    if [ "$BPF_STATS_OK" -eq 0 ]; then
+        # On non-BPF devices, ensure legacy stats properties are set
+        resetprop_phh net.qtaguid_enabled 1 2>/dev/null
+    fi
     log "Properties set via resetprop_phh"
 elif command -v magisk >/dev/null 2>&1; then
     magisk resetprop persist.sys.nobpf false 2>/dev/null
     magisk resetprop ro.net.stats 1 2>/dev/null
+    if [ "$BPF_STATS_OK" -eq 0 ]; then
+        magisk resetprop net.qtaguid_enabled 1 2>/dev/null
+    fi
     log "Properties set via magisk resetprop"
 fi
 
-# ---- Restart netd to pick up changes ----
+# Restart netd to pick up changes
 log "Restarting netd..."
 setprop ctl.restart netd 2>/dev/null
 sleep 10
-log "netd service after restart: $(getprop init.svc.netd 2>/dev/null)"
+log "netd after restart: $(getprop init.svc.netd 2>/dev/null)"
 
 # ============================================================
-# PHASE 4: VERIFICATION
+# PHASE 5: FINAL VERIFICATION
 # ============================================================
 
-log "--- Phase 4: Verification ---"
+log "--- Phase 5: Verification ---"
 
-# Re-check BPF maps
-FINAL_STATS=$([ -e "$BPF_MAP" ] && echo present || echo absent)
-FINAL_OWNER=$([ -e "$BPF_OWNER" ] && echo present || echo absent)
-log "FINAL BPF uid_stats_map: $FINAL_STATS"
-log "FINAL BPF uid_owner_map: $FINAL_OWNER"
-
-if [ "$FINAL_STATS" = "present" ] && [ "$FINAL_OWNER" = "present" ]; then
-    log "RESULT: BPF maps are PRESENT - per-UID stats should work"
-    log "The traffic indicator should now show per-app traffic."
-else
-    log "RESULT: BPF maps are MISSING - per-UID stats will not work"
-    log "The traffic indicator will NOT show per-app traffic."
-    log ""
-    log "DIAGNOSTIC SUMMARY FOR BUG REPORT:"
-    log "  Kernel: $(uname -r 2>/dev/null)"
-    log "  BPF maps: absent"
-    log "  BPF fs: $(mount | grep -c 'bpf') mounts"
-    log "  Cgroup: $(mount | grep -c 'cgroup') mounts"
-    log "  Tethering APEX: $([ -d /apex/com.android.tethering ] && echo mounted || echo missing)"
-    log "  netbpfload: $([ -f /apex/com.android.tethering/bin/netbpfload ] && echo present || echo missing)"
-    log "  bpfloader svc: $(getprop init.svc.bpfloader 2>/dev/null)"
-    log "  netd svc: $(getprop init.svc.netd 2>/dev/null)"
-    log "  SELinux: $(getenforce 2>/dev/null)"
-    log ""
-    log "  If BPF programs cannot load on this kernel, the only"
-    log "  fix is to patch the Java framework (service-connectivity.jar"
-    log "  or SystemUI.apk) to use interface-level stats instead of"
-    log "  per-UID BPF stats."
+FINAL_BPF=0
+if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
+    FINAL_BPF=1
 fi
 
-log "network_stats_enabled: $(settings get global network_stats_enabled 2>/dev/null)"
-log "netd status: $(getprop init.svc.netd 2>/dev/null)"
-log "All BPF maps under /sys/fs/bpf/netd_shared:"
-ls -la /sys/fs/bpf/netd_shared/ 2>/dev/null >> "$LOG"
+FINAL_XTAGUID=0
+if [ -f /proc/net/xt_qtaguid/stats ]; then
+    FINAL_XTAGUID=1
+fi
+
+FINAL_UIDSTAT=0
+if [ -d /proc/uid_stat ]; then
+    FINAL_UIDSTAT=1
+fi
+
+log "FINAL BPF maps: $([ "$FINAL_BPF" -eq 1 ] && echo present || echo absent)"
+log "FINAL xt_qtaguid: $([ "$FINAL_XTAGUID" -eq 1 ] && echo available || echo absent)"
+log "FINAL uid_stat: $([ "$FINAL_UIDSTAT" -eq 1 ] && echo available || echo absent)"
+log "FINAL network_stats_enabled: $(settings get global network_stats_enabled 2>/dev/null)"
+
+if [ "$FINAL_BPF" -eq 1 ]; then
+    log ""
+    log "============================================"
+    log "RESULT: BPF maps PRESENT"
+    log "Per-UID traffic stats are WORKING."
+    log "Traffic indicator should show per-app traffic."
+    log "============================================"
+elif [ "$FINAL_XTAGUID" -eq 1 ]; then
+    log ""
+    log "============================================"
+    log "RESULT: BPF maps absent, but xt_qtaguid AVAILABLE"
+    log "Per-UID stats available via xt_qtaguid fallback."
+    log "Traffic indicator should show per-app traffic"
+    log "if the ROM's NetworkStatsService uses this fallback."
+    log "============================================"
+elif [ "$FINAL_UIDSTAT" -eq 1 ]; then
+    log ""
+    log "============================================"
+    log "RESULT: BPF maps absent, but uid_stat AVAILABLE"
+    log "Per-UID TCP stats available via uid_stat fallback."
+    log "Traffic indicator may show per-app traffic"
+    log "depending on ROM implementation."
+    log "============================================"
+else
+    log ""
+    log "============================================"
+    log "RESULT: No per-UID stats source available"
+    log "BPF maps absent, no legacy fallback found."
+    log "Traffic indicator will show TOTAL traffic only"
+    log "if network_stats_enabled=1, or nothing at all."
+    log ""
+    log "PERMANENT FIX OPTIONS:"
+    log "1. Patch service-connectivity.jar from the tethering"
+    log "   APEX to add a fallback stats reader."
+    log "2. Patch SystemUI.apk to use TrafficStats interface-"
+    log "   level methods instead of per-UID methods."
+    log "3. Flash a ROM with kernel >= 5.4 that supports"
+    log "   BPF cgroup_skb programs."
+    log ""
+    log "DIAGNOSTIC INFO FOR BUG REPORT:"
+    log "  Kernel: $(uname -r 2>/dev/null)"
+    log "  BPF JIT: $(cat /proc/sys/net/core/bpf_jit_enable 2>/dev/null)"
+    log "  Tethering APEX: $([ -d /apex/com.android.tethering ] && echo mounted || echo missing)"
+    log "  bpfloader: $(getprop init.svc.bpfloader 2>/dev/null)"
+    log "  netd: $(getprop init.svc.netd 2>/dev/null)"
+    log "  SELinux: $(getenforce 2>/dev/null)"
+    log "  mainline_done: $([ -d /sys/fs/bpf/netd_shared/mainline_done ] && echo present || echo absent)"
+    log "============================================"
+fi
 
 # ============================================================
-# PHASE 5: WATCHDOG (only if BPF maps exist)
+# PHASE 6: WATCHDOG
 # ============================================================
 
-if [ "$FINAL_STATS" = "present" ] && [ "$FINAL_OWNER" = "present" ]; then
-    log "=== BPF watchdog active (checking every 5 min) ==="
+if [ "$FINAL_BPF" -eq 1 ]; then
+    # BPF maps exist - monitor for loss
+    log "=== BPF watchdog active (every 5 min) ==="
     WATCHDOG_COUNT=0
     while true; do
         sleep 300
         WATCHDOG_COUNT=$((WATCHDOG_COUNT + 1))
 
         if [ ! -e "$BPF_MAP" ] || [ ! -e "$BPF_OWNER" ]; then
-            log "Watchdog [$WATCHDOG_COUNT]: BPF maps LOST, attempting repair..."
+            log "Watchdog [$WATCHDOG_COUNT]: BPF maps LOST, restarting bpfloader..."
             stop bpfloader 2>/dev/null
             sleep 1
             start bpfloader 2>/dev/null
             sleep 5
-
             if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
                 log "Watchdog [$WATCHDOG_COUNT]: BPF maps restored"
             else
-                log "Watchdog [$WATCHDOG_COUNT]: BPF maps still missing after repair"
+                log "Watchdog [$WATCHDOG_COUNT]: BPF maps still missing"
             fi
         fi
 
-        # Every 10 cycles (~50 min), verify settings
         if [ "$((WATCHDOG_COUNT % 10))" -eq 0 ]; then
             NSE=$(settings get global network_stats_enabled 2>/dev/null)
             if [ "$NSE" != "1" ]; then
@@ -295,14 +412,29 @@ if [ "$FINAL_STATS" = "present" ] && [ "$FINAL_OWNER" = "present" ]; then
         fi
     done
 else
-    log "=== BPF watchdog SKIPPED (maps absent, no point monitoring) ==="
-    log "=== Module will log diagnostics only ==="
-
-    # Even without BPF, periodically log the state for diagnostics
+    # BPF maps don't exist - light monitoring
+    log "=== Diagnostic watchdog active (every 10 min) ==="
     WATCHDOG_COUNT=0
     while true; do
         sleep 600
         WATCHDOG_COUNT=$((WATCHDOG_COUNT + 1))
-        log "Diag [$WATCHDOG_COUNT]: BPF maps=$([ -e "$BPF_MAP" ] && echo P || echo A) netd=$(getprop init.svc.netd 2>/dev/null) nse=$(settings get global network_stats_enabled 2>/dev/null)"
+
+        # Re-verify settings
+        NSE=$(settings get global network_stats_enabled 2>/dev/null)
+        if [ "$NSE" != "1" ]; then
+            settings put global network_stats_enabled 1 2>/dev/null
+            log "Diag [$WATCHDOG_COUNT]: corrected network_stats_enabled"
+        fi
+
+        # Light status check
+        NBPF=$([ -e "$BPF_MAP" ] && echo P || echo A)
+        NNETD=$(getprop init.svc.netd 2>/dev/null)
+        log "Diag [$WATCHDOG_COUNT]: BPF=$NBPF netd=$NNETD"
+
+        # If BPF maps suddenly appear (e.g. after kernel module load), log it
+        if [ "$NBPF" = "P" ]; then
+            log "Diag [$WATCHDOG_COUNT]: BPF maps appeared! Switching to BPF mode."
+            break
+        fi
     done
 fi

@@ -1,6 +1,6 @@
 id=netstats-fix
-name=EvoX GSI Network Stats Fix
-version=v2.0
-versionCode=2
+name=Network Stats Fix (Universal GSI)
+version=v3.0
+versionCode=3
 author=Flint
-description=Fixes broken network traffic indicator and per-UID network stats on EvoX GSI. Attempts to repair BPF program loading from the tethering APEX so NetworkStatsService can read per-UID byte counters. Falls back to interface-level stats and collects detailed diagnostics when BPF repair is not possible.
+description=Fixes broken network traffic indicator and per-UID network stats on Android 12-16 GSIs. Repairs BPF program loading on capable kernels, falls back to xt_qtaguid/uid_stat on legacy kernels (4.14 etc), and ensures interface-level stats as a last resort. Universal compatibility across EvoX, Infinity X, Axion, and other Treble GSIs.

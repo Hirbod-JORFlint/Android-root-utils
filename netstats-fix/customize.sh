@@ -3,66 +3,79 @@
 # Runs during module installation
 
 ui_print "========================================"
-ui_print "  EvoX GSI Network Stats Fix  v2.0"
+ui_print "  EvoX GSI Network Stats Fix  v3.0"
 ui_print "========================================"
+ui_print ""
+ui_print "Universal network traffic indicator fix"
+ui_print "for Android 12-16 GSIs."
 ui_print ""
 
 # ---- Install-time diagnostics ----
-ui_print "- Collecting device info..."
+ui_print "- Device diagnostics..."
 
-KVER=$(uname -r 2>/dev/null || echo "unknown")
+KVER=$(uname -r 2>/dev/null || echo unknown)
 ui_print "  Kernel: $KVER"
 
-# Check BPF filesystem
+KMAJOR=$(echo "$KVER" | cut -d. -f1)
+KMINOR=$(echo "$KVER" | cut -d. -f2)
+
+# BPF filesystem
 if mount | grep -q 'bpf.*\/sys\/fs\/bpf'; then
     ui_print "  BPF filesystem: mounted"
 else
-    ui_print "  BPF filesystem: NOT mounted (will attempt mount at boot)"
+    ui_print "  BPF filesystem: not mounted"
 fi
 
-# Check BPF maps
+# BPF maps
 BPF_MAP="/sys/fs/bpf/netd_shared/map_netd_uid_stats_map"
 BPF_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
 if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-    ui_print "  BPF stats maps: PRESENT"
+    ui_print "  BPF maps: PRESENT (may already be working)"
 else
-    ui_print "  BPF stats maps: MISSING"
-    ui_print "    uid_stats_map: $([ -e "$BPF_MAP" ] && echo present || echo absent)"
-    ui_print "    uid_owner_map: $([ -e "$BPF_OWNER" ] && echo present || echo absent)"
-    ui_print "  (This is the root cause - will attempt repair at boot)"
+    ui_print "  BPF maps: MISSING"
+    ui_print "    uid_stats_map: $([ -e "$BPF_MAP" ] && echo P || echo A)"
+    ui_print "    uid_owner_map: $([ -e "$BPF_OWNER" ] && echo P || echo A)"
 fi
 
-# Check tethering APEX
+# mainline_done marker (netbpfload ran but maps missing)
+if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
+    ui_print "  mainline_done: yes (BPF loader ran but skipped network maps)"
+fi
+
+# Tethering APEX
 if [ -d /apex/com.android.tethering ]; then
     ui_print "  Tethering APEX: mounted"
-    if [ -f /apex/com.android.tethering/bin/netbpfload ]; then
-        ui_print "  netbpfload: present"
-    else
-        ui_print "  netbpfload: MISSING from APEX"
-    fi
 else
     ui_print "  Tethering APEX: NOT mounted"
 fi
 
-# Check cgroup mounts (needed for cgroup_skb BPF programs)
-if mount | grep -q 'cgroup'; then
-    ui_print "  Cgroup: mounted"
+# Legacy stats interfaces
+if [ -f /proc/net/xt_qtaguid/stats ]; then
+    ui_print "  xt_qtaguid: AVAILABLE (legacy fallback possible)"
+elif [ -c /dev/xt_qtaguid ]; then
+    ui_print "  xt_qtaguid: device exists (module may need loading)"
 else
-    ui_print "  Cgroup: NOT mounted (BPF cgroup_skb will fail)"
+    ui_print "  xt_qtaguid: not found"
+fi
+if [ -d /proc/uid_stat ]; then
+    ui_print "  uid_stat: AVAILABLE (legacy fallback possible)"
+else
+    ui_print "  uid_stat: not found"
 fi
 
-# Check kernel BPF support
-if [ -d /sys/fs/bpf ]; then
-    ui_print "  /sys/fs/bpf: exists"
+# Kernel BPF capability assessment
+if [ "$KMAJOR" -lt 4 ] || { [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -lt 15 ]; }; then
+    ui_print "  BPF capability: kernel too old for cgroup_skb"
+elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -le 14 ]; then
+    ui_print "  BPF capability: kernel 4.14 (cgroup_skb unlikely)"
 else
-    ui_print "  /sys/fs/bpf: MISSING"
+    ui_print "  BPF capability: kernel should support cgroup_skb"
 fi
 
-# Check restricted_networking_mode
-RNM=$(settings get global restricted_networking_mode 2>/dev/null || echo "unknown")
+# Settings
+RNM=$(settings get global restricted_networking_mode 2>/dev/null || echo unknown)
 ui_print "  restricted_networking_mode: $RNM"
-
-NSE=$(settings get global network_stats_enabled 2>/dev/null || echo "unknown")
+NSE=$(settings get global network_stats_enabled 2>/dev/null || echo unknown)
 ui_print "  network_stats_enabled: $NSE"
 
 ui_print ""
@@ -74,12 +87,11 @@ set_perm $MODPATH/service.sh 0 0 0755
 
 ui_print "- Permissions set"
 ui_print ""
-ui_print "What this module does:"
-ui_print "  1. Prepares BPF filesystem and cgroup mounts"
-ui_print "  2. Attempts to repair BPF program loading"
-ui_print "     from the tethering APEX"
-ui_print "  3. Falls back to interface-level stats"
-ui_print "  4. Collects detailed diagnostics"
+ui_print "Strategy:"
+ui_print "  1. Try to repair BPF program loading"
+ui_print "  2. Fall back to xt_qtaguid/uid_stat if needed"
+ui_print "  3. Ensure interface-level stats at minimum"
 ui_print ""
 ui_print "- Install complete. Reboot required."
+ui_print "  After reboot, check: cat /data/local/tmp/netstats-fix.log"
 ui_print "========================================"
