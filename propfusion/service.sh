@@ -1,21 +1,11 @@
 #!/system/bin/sh
 
-# Wait until Android has finished booting
-until [ "$(getprop sys.boot_completed)" = "1" ]; do
-    sleep 2
-done
-
-sleep 5
-
 # Verify that this script actually ran
 resetprop persist.service.media_tweaks.loaded 1
 
 ########################################
 # Built-in tweaks
 ########################################
-
-resetprop media.stagefright.thumbnail.prefer_hw_codecs false
-resetprop vendor.media.omx 0
 
 resetprop media.stagefright.enable-player true
 resetprop media.stagefright.enable-http true
