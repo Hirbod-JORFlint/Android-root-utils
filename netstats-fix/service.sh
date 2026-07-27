@@ -349,19 +349,11 @@ fi
 
 log "--- Phase 4: Settings ---"
 
-# Ensure network_stats_enabled (required for ANY stats collection)
-settings put global network_stats_enabled 1 2>/dev/null
-log "network_stats_enabled: $(settings get global network_stats_enabled 2>/dev/null)"
-
-# Ensure restricted_networking_mode stays at whatever phh set it
-log "restricted_networking_mode: $(settings get global restricted_networking_mode 2>/dev/null)"
-
-# Set stats-related properties
+# Step 1: Set stats-related properties BEFORE netd restart
 if command -v resetprop_phh >/dev/null 2>&1; then
     resetprop_phh persist.sys.nobpf false 2>/dev/null
     resetprop_phh ro.net.stats 1 2>/dev/null
     if [ "$BPF_STATS_OK" -eq 0 ]; then
-        # On non-BPF devices, ensure legacy stats properties are set
         resetprop_phh net.qtaguid_enabled 1 2>/dev/null
     fi
     log "Properties set via resetprop_phh"
@@ -374,29 +366,69 @@ elif command -v magisk >/dev/null 2>&1; then
     log "Properties set via magisk resetprop"
 fi
 
-# Restart netd to pick up changes
+# Step 2: Restart netd to pick up property changes
 log "Restarting netd..."
 setprop ctl.restart netd 2>/dev/null
 sleep 10
 log "netd after restart: $(getprop init.svc.netd 2>/dev/null)"
 
-# Re-apply network_stats_enabled AFTER netd restart.
-# Some ROMs clear global settings when netd restarts. Setting it after
-# ensures it persists. Retry a few times in case the Settings Provider
-# hasn't fully initialized yet.
-for i in 1 2 3; do
+# Step 3: Set network_stats_enabled AFTER netd restart.
+# Some ROMs clear global Settings when netd restarts. We set it after
+# to ensure it persists, then wait for Settings Provider to stabilize.
+sleep 5
+for i in 1 2 3 4 5; do
     settings put global network_stats_enabled 1 2>/dev/null
-    sleep 1
+    sleep 3
+    NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
+    if [ "$NSE_NOW" = "1" ]; then
+        log "network_stats_enabled: confirmed 1 (attempt $i)"
+        break
+    fi
+    log "network_stats_enabled attempt $i: ${NSE_NOW:-empty}, retrying..."
 done
 NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
-log "network_stats_enabled (post-restart): ${NSE_NOW:-empty}"
 if [ "$NSE_NOW" != "1" ]; then
-    log "WARN: network_stats_enabled still not 1, trying via content provider..."
+    log "WARN: trying content provider fallback..."
     content call --uri content://settings/global --method PUT --arg network_stats_enabled --extra value:s:1 2>/dev/null
-    sleep 1
+    sleep 3
     NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
     log "network_stats_enabled (content provider): ${NSE_NOW:-empty}"
 fi
+
+# Step 4: Force NetworkStatsService to re-initialize.
+# On Android, SIGHUP to system_server triggers a process restart
+# (via zygote). This causes ALL services including NetworkStatsService
+# to re-initialize and read current settings. This is the key step
+# that makes the traffic indicator work on older kernels where BPF
+# isn't available but interface-level stats are sufficient.
+log "Ensuring NetworkStatsService picks up settings..."
+SS_PID=$(pidof system_server 2>/dev/null)
+if [ -n "$SS_PID" ]; then
+    log "system_server PID: $SS_PID"
+    # Try cmd netstats first (available on Android 9+)
+    if cmd netstats force-refresh 2>/dev/null; then
+        log "  cmd netstats force-refresh: success"
+    else
+        log "  cmd netstats force-refresh: not available or failed"
+    fi
+    sleep 2
+    # Send SIGHUP to trigger full service re-initialization
+    kill -HUP "$SS_PID" 2>/dev/null
+    log "  Sent SIGHUP to system_server to trigger NetworkStatsService re-init"
+    # Wait for system_server to come back
+    sleep 15
+    # Re-apply network_stats_enabled in case it got lost during restart
+    settings put global network_stats_enabled 1 2>/dev/null
+    log "  Re-applied network_stats_enabled after system_server restart"
+else
+    log "  WARN: system_server PID not found"
+fi
+
+# Step 5: Final verification
+sleep 5
+FINAL_NSE=$(settings get global network_stats_enabled 2>/dev/null)
+log "network_stats_enabled (final): ${FINAL_NSE:-empty}"
+log "restricted_networking_mode: $(settings get global restricted_networking_mode 2>/dev/null)"
 
 # ============================================================
 # PHASE 5: FINAL VERIFICATION
@@ -422,7 +454,7 @@ fi
 log "FINAL BPF maps: $([ "$FINAL_BPF" -eq 1 ] && echo present || echo absent)"
 log "FINAL xt_qtaguid: $([ "$FINAL_XTAGUID" -eq 1 ] && echo available || echo absent)"
 log "FINAL uid_stat: $([ "$FINAL_UIDSTAT" -eq 1 ] && echo available || echo absent)"
-log "FINAL network_stats_enabled: $(settings get global network_stats_enabled 2>/dev/null)"
+log "FINAL network_stats_enabled: ${FINAL_NSE:-empty}"
 
 if [ "$FINAL_BPF" -eq 1 ]; then
     log ""
@@ -508,28 +540,37 @@ if [ "$FINAL_BPF" -eq 1 ]; then
         fi
     done
 else
-    # BPF maps don't exist - light monitoring
-    log "=== Diagnostic watchdog active (every 10 min) ==="
+    # BPF maps don't exist - ensure network_stats_enabled stays set
+    # and monitor for changes
+    log "=== Settings watchdog active (every 5 min) ==="
     WATCHDOG_COUNT=0
     while true; do
-        sleep 600
+        sleep 300
         WATCHDOG_COUNT=$((WATCHDOG_COUNT + 1))
 
-        # Re-verify settings
+        # Re-verify network_stats_enabled (critical for interface-level stats)
         NSE=$(settings get global network_stats_enabled 2>/dev/null)
         if [ "$NSE" != "1" ]; then
             settings put global network_stats_enabled 1 2>/dev/null
-            log "Diag [$WATCHDOG_COUNT]: corrected network_stats_enabled"
+            log "Watchdog [$WATCHDOG_COUNT]: corrected network_stats_enabled"
+            # If netd restarted and cleared it again, re-trigger
+            if [ "$((WATCHDOG_COUNT % 4))" -eq 0 ]; then
+                SS_PID=$(pidof system_server 2>/dev/null)
+                if [ -n "$SS_PID" ]; then
+                    cmd netstats force-refresh 2>/dev/null
+                    log "Watchdog [$WATCHDOG_COUNT]: cmd netstats force-refresh"
+                fi
+            fi
         fi
 
         # Light status check
         NBPF=$([ -e "$BPF_MAP" ] && echo P || echo A)
         NNETD=$(getprop init.svc.netd 2>/dev/null)
-        log "Diag [$WATCHDOG_COUNT]: BPF=$NBPF netd=$NNETD"
+        log "Watchdog [$WATCHDOG_COUNT]: BPF=$NBPF netd=$NNETD NSE=$NSE"
 
         # If BPF maps suddenly appear (e.g. after kernel module load), log it
         if [ "$NBPF" = "P" ]; then
-            log "Diag [$WATCHDOG_COUNT]: BPF maps appeared! Switching to BPF mode."
+            log "Watchdog [$WATCHDOG_COUNT]: BPF maps appeared! Switching to BPF mode."
             break
         fi
     done
