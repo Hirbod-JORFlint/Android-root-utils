@@ -95,6 +95,15 @@ KMAJOR=$(uname -r | cut -d. -f1)
 KMINOR=$(uname -r | cut -d. -f2)
 log "Kernel major.minor: ${KMAJOR}.${KMINOR}"
 
+# Determine if BPF repair is worth attempting.
+# Kernel < 5.0 generally cannot run cgroup_skb BPF programs needed
+# for per-UID network stats. Attempting bpfloader restarts wastes ~20s.
+BPF_REPAIR_WORTH_TRYING=1
+if [ "$KMAJOR" -lt 5 ]; then
+    BPF_REPAIR_WORTH_TRYING=0
+    log "Kernel < 5.0: BPF cgroup_skb not available, skipping repair"
+fi
+
 # ---- Check legacy per-UID stats interfaces ----
 HAS_XTAGUID=0
 HAS_UIDSTAT=0
@@ -116,12 +125,36 @@ fi
 log "BPF-related kernel messages:"
 dmesg | grep -iE 'bpf|cgroup_skb|netd.*map|bpfloader|verifier' 2>/dev/null | tail -20 >> "$LOG"
 
+# ---- Capture netbpfload exit status from dmesg ----
+NBPFP_STATUS=$(dmesg | grep -i 'netbpfload\|NetBpfLoad' 2>/dev/null | tail -5)
+if [ -n "$NBPFP_STATUS" ]; then
+    log "netbpfload dmesg output:"
+    echo "$NBPFP_STATUS" >> "$LOG"
+    # Check if it reported success but maps are still missing
+    if echo "$NBPFP_STATUS" | grep -qi 'success'; then
+        log "  netbpfload reported success but network maps missing (kernel too old)"
+    fi
+fi
+# Also capture bpfloader errors
+BPFLOADER_ERRS=$(dmesg | grep -i 'BpfLoader-rs\|bpfloader.*error\|bpfloader.*fail' 2>/dev/null | tail -10)
+if [ -n "$BPFLOADER_ERRS" ]; then
+    log "bpfloader errors:"
+    echo "$BPFLOADER_ERRS" >> "$LOG"
+fi
+# Capture SELinux denials for bpfloader
+BPF_AVCS=$(dmesg | grep -i 'avc.*denied.*bpfloader\|avc.*denied.*bpf' 2>/dev/null | tail -5)
+if [ -n "$BPF_AVCS" ]; then
+    log "SELinux denials for bpfloader:"
+    echo "$BPF_AVCS" >> "$LOG"
+fi
+
 # ============================================================
 # PHASE 2: BPF REPAIR (only if BPF maps missing)
 # ============================================================
 
 if [ "$BPF_STATS_OK" -eq 0 ]; then
-    log "--- Phase 2: BPF Repair Attempt ---"
+    if [ "$BPF_REPAIR_WORTH_TRYING" -eq 1 ]; then
+        log "--- Phase 2: BPF Repair Attempt ---"
 
     # ---- Repair 1: Restart bpfloader service ----
     # This is the ONLY reliable way to invoke netbpfload because it
@@ -198,6 +231,10 @@ if [ "$BPF_STATS_OK" -eq 0 ]; then
         fi
         setenforce 1 2>/dev/null
         log "  SELinux restored to Enforcing"
+    fi
+    else
+        log "--- Phase 2: BPF Repair SKIPPED (kernel ${KMAJOR}.${KMINOR} too old) ---"
+        log "  BPF cgroup_skb programs require kernel >= 5.0"
     fi
 fi
 
@@ -301,6 +338,24 @@ log "Restarting netd..."
 setprop ctl.restart netd 2>/dev/null
 sleep 10
 log "netd after restart: $(getprop init.svc.netd 2>/dev/null)"
+
+# Re-apply network_stats_enabled AFTER netd restart.
+# Some ROMs clear global settings when netd restarts. Setting it after
+# ensures it persists. Retry a few times in case the Settings Provider
+# hasn't fully initialized yet.
+for i in 1 2 3; do
+    settings put global network_stats_enabled 1 2>/dev/null
+    sleep 1
+done
+NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
+log "network_stats_enabled (post-restart): ${NSE_NOW:-empty}"
+if [ "$NSE_NOW" != "1" ]; then
+    log "WARN: network_stats_enabled still not 1, trying via content provider..."
+    content call --uri content://settings/global --method PUT --arg network_stats_enabled --extra value:s:1 2>/dev/null
+    sleep 1
+    NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
+    log "network_stats_enabled (content provider): ${NSE_NOW:-empty}"
+fi
 
 # ============================================================
 # PHASE 5: FINAL VERIFICATION

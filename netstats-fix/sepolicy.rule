@@ -1,0 +1,8 @@
+# sepolicy.rule - SELinux policy patches for netstats-fix module
+# Fixes bpfloader denials that prevent BPF program loading on some devices
+
+# bpfloader needs to search sysfs memory management directory
+allow bpfloader sysfs_mm dir search
+
+# bpfloader needs to read sysfs mm entries (for BPF map sizing)
+allow bpfloader sysfs_mm file read
