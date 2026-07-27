@@ -1,0 +1,3 @@
+ro.net.stats=1
+persist.sys.netstats=1
+persist.sys.nobpf=false
