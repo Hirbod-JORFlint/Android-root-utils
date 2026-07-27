@@ -3,7 +3,8 @@
 # Runs during module installation
 
 ui_print "========================================"
-ui_print "  EvoX GSI Network Stats Fix  v3.0"
+ui_print "  Network Stats Fix (Universal GSI)"
+ui_print "  v4.0 by Flint"
 ui_print "========================================"
 ui_print ""
 ui_print "Universal network traffic indicator fix"
@@ -18,12 +19,14 @@ ui_print "  Kernel: $KVER"
 
 KMAJOR=$(echo "$KVER" | cut -d. -f1)
 KMINOR=$(echo "$KVER" | cut -d. -f2)
+KPATCH=$(echo "$KVER" | cut -d. -f3 | cut -d- -f1)
+ui_print "  Kernel version for BPF: ${KMAJOR}.${KMINOR}.${KPATCH}"
 
 # BPF filesystem
 if mount | grep -q 'bpf.*\/sys\/fs\/bpf'; then
     ui_print "  BPF filesystem: mounted"
 else
-    ui_print "  BPF filesystem: not mounted"
+    ui_print "  BPF filesystem: not mounted (will mount at boot)"
 fi
 
 # BPF maps
@@ -32,14 +35,15 @@ BPF_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
 if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
     ui_print "  BPF maps: PRESENT (may already be working)"
 else
-    ui_print "  BPF maps: MISSING"
+    ui_print "  BPF maps: MISSING (module will attempt repair)"
     ui_print "    uid_stats_map: $([ -e "$BPF_MAP" ] && echo P || echo A)"
     ui_print "    uid_owner_map: $([ -e "$BPF_OWNER" ] && echo P || echo A)"
 fi
 
-# mainline_done marker (netbpfload ran but maps missing)
+# mainline_done marker
 if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
-    ui_print "  mainline_done: yes (BPF loader ran but skipped network maps)"
+    ui_print "  mainline_done: yes (netbpfload ran but maps missing)"
+    ui_print "    Module will delete this and force a retry"
 fi
 
 # Tethering APEX
@@ -64,12 +68,15 @@ else
 fi
 
 # Kernel BPF capability assessment
-if [ "$KMAJOR" -lt 4 ] || { [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -lt 15 ]; }; then
-    ui_print "  BPF capability: kernel too old for cgroup_skb"
+if [ "$KMAJOR" -lt 4 ] || { [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -lt 9 ]; }; then
+    ui_print "  BPF capability: kernel too old (< 4.9)"
 elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -le 14 ]; then
-    ui_print "  BPF capability: kernel 4.14 (cgroup_skb unlikely)"
+    ui_print "  BPF capability: kernel ${KMAJOR}.${KMINOR} (limited BPF)"
+    ui_print "    cgroup_skb may not be fully supported"
+elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -le 19 ]; then
+    ui_print "  BPF capability: kernel ${KMAJOR}.${KMINOR} (good BPF support)"
 else
-    ui_print "  BPF capability: kernel should support cgroup_skb"
+    ui_print "  BPF capability: kernel ${KMAJOR}.${KMINOR} (excellent BPF support)"
 fi
 
 # Settings
@@ -78,6 +85,19 @@ ui_print "  restricted_networking_mode: $RNM"
 NSE=$(settings get global network_stats_enabled 2>/dev/null || echo unknown)
 ui_print "  network_stats_enabled: $NSE"
 
+# ro.bpf.kver_override
+KVER_PROP=$(getprop ro.bpf.kver_override 2>/dev/null)
+ui_print "  ro.bpf.kver_override: ${KVER_PROP:-not set}"
+
+ui_print ""
+
+# ---- Strategy explanation ----
+ui_print "Strategy:"
+ui_print "  1. Set ro.bpf.kver_override to actual kernel version"
+ui_print "  2. Delete mainline_done marker"
+ui_print "  3. Force bpfloader retry with correct BPF programs"
+ui_print "  4. Fall back to xt_qtaguid/uid_stat if needed"
+ui_print "  5. Ensure interface-level stats as minimum"
 ui_print ""
 
 # ---- Set permissions ----
@@ -87,11 +107,6 @@ set_perm $MODPATH/service.sh 0 0 0755
 [ -f "$MODPATH/sepolicy.rule" ] && set_perm $MODPATH/sepolicy.rule 0 0 0644
 
 ui_print "- Permissions set"
-ui_print ""
-ui_print "Strategy:"
-ui_print "  1. Try to repair BPF program loading"
-ui_print "  2. Fall back to xt_qtaguid/uid_stat if needed"
-ui_print "  3. Ensure interface-level stats at minimum"
 ui_print ""
 ui_print "- Install complete. Reboot required."
 ui_print "  After reboot, check: cat /data/local/tmp/netstats-fix.log"
