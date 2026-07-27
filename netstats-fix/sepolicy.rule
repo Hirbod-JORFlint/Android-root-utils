@@ -2,35 +2,35 @@
 # These rules fix denials observed across multiple devices and kernels
 
 # ---- bpfloader needs sysfs access for BPF map sizing ----
-allow bpfloader sysfs_mm dir search
-allow bpfloader sysfs_mm file read
+allow bpfloader sysfs_mm dir search;
+allow bpfloader sysfs_mm file read;
 
-# ---- bpfloader needs to read kernel symbols for BPF program loading ----
-# On some kernels, bpfloader needs CAP_SYSLOG to read /proc/kallsyms
-allow bpfloader kernel system syslog_read
+# ---- bpfloader needs to access kernel symbols ----
+allow bpfloader kernel kernel { syslog };
 
 # ---- bpfloader needs to create and pin BPF maps ----
-allow bpfloader fs_bpf dir search
-allow bpfloader fs_bpf file create
-allow bpfloader fs_bpf file write
-allow bpfloader fs_bpf dir write
-allow bpfloader fs_bpf file read
+allow bpfloader fs_bpf dir { search create write read };
+allow bpfloader fs_bpf file { create write read };
 
 # ---- bpfloader needs to load BPF programs ----
-allow bpfloader bpf map create
-allow bpfloader bpf prog load
+allow bpfloader bpf { map_create prog_load };
 
-# ---- bpfloader needs network admin for cgroup_skb programs ----
-allow bpfloader system_file file execute
-allow bpfloader netd_shared_bpf dir search
-allow bpfloader netd_shared_bpf file create
-allow bpfloader netd_shared_bpf file write
-allow bpfloader netd_shared_bpf file read
+# ---- bpfloader needs to create netd_shared directory ----
+allow bpfloader fs_bpf dir create;
+allow bpfloader fs_bpf dir write;
 
 # ---- netd needs to read BPF maps ----
-allow netd fs_bpf dir search
-allow netd fs_bpf file read
-allow netd bpf map read
+allow netd fs_bpf dir search;
+allow netd fs_bpf file read;
+allow netd bpf map read;
+allow netd bpf map get_info_by_fd;
 
-# ---- Allow init to restart bpfloader ----
-allow init bpfloader_service service_manager find
+# ---- init needs to restart bpfloader ----
+allow init bpfloader service { find };
+
+# ---- netd needs sysfs access for stats ----
+allow netd sysfs file { read open };
+allow netd sysfs dir { search open read };
+
+# ---- allow bpfloader to execute through init ----
+allow init bpfloader_exec file execute_no_trans;

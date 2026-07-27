@@ -35,7 +35,18 @@ log "Build: $BUILD"
 CORRECT_KVER="${KMAJOR}.${KMINOR}.${KPATCH}"
 log "Correct kernel version for BPF: $CORRECT_KVER"
 
-# ---- 2. Mount BPF filesystem if needed ----
+# ---- 2. Delete mainline_done BEFORE anything else (CRITICAL FIX) ----
+# This must happen BEFORE we interact with bpfloader.
+# bpfloader checks for mainline_done; if present, it skips loading.
+# We delete it first to ensure a clean slate.
+if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
+    rm -rf /sys/fs/bpf/netd_shared/mainline_done 2>/dev/null
+    log "Deleted mainline_done marker (PRIORITY)"
+else
+    log "mainline_done not present (clean state)"
+fi
+
+# ---- 3. Mount BPF filesystem if needed ----
 if ! mount | grep -q 'bpf.*\/sys\/fs\/bpf'; then
     mount -t bpf bpf /sys/fs/bpf 2>/dev/null
     log "Mounted BPF filesystem"
@@ -45,11 +56,11 @@ fi
 chmod 0755 /sys/fs/bpf 2>/dev/null
 chmod -R 0755 /sys/fs/bpf/ 2>/dev/null
 
-# ---- 3. Ensure netd_shared directory exists ----
+# ---- 4. Ensure netd_shared directory exists ----
 mkdir -p /sys/fs/bpf/netd_shared 2>/dev/null
 chmod 0755 /sys/fs/bpf/netd_shared 2>/dev/null
 
-# ---- 4. Set ro.bpf.kver_override to ACTUAL kernel version ----
+# ---- 5. Set ro.bpf.kver_override to ACTUAL kernel version ----
 # This is THE critical property. netbpfload uses it to select which
 # BPF program variants to load. Setting it too high = loading programs
 # the kernel can't handle. Setting it correctly = loading compatible variants.
@@ -57,39 +68,46 @@ CURRENT_KVER_PROP=$(getprop ro.bpf.kver_override 2>/dev/null)
 log "ro.bpf.kver_override: ${CURRENT_KVER_PROP:-not set}"
 
 if [ "$CURRENT_KVER_PROP" != "$CORRECT_KVER" ]; then
+    RESETPROP_SET=0
     if command -v resetprop_phh >/dev/null 2>&1; then
         resetprop_phh ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null
+        RESETPROP_SET=1
         log "Set ro.bpf.kver_override=$CORRECT_KVER via resetprop_phh"
-    elif command -v resetprop >/dev/null 2>&1; then
+    fi
+    
+    if [ "$RESETPROP_SET" -eq 0 ] && command -v resetprop >/dev/null 2>&1; then
         resetprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null
+        RESETPROP_SET=1
         log "Set ro.bpf.kver_override=$CORRECT_KVER via resetprop"
-    elif command -v magisk >/dev/null 2>&1; then
+    fi
+    
+    if [ "$RESETPROP_SET" -eq 0 ] && command -v magisk >/dev/null 2>&1; then
         magisk resetprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null
+        RESETPROP_SET=1
         log "Set ro.bpf.kver_override=$CORRECT_KVER via magisk resetprop"
+    fi
+    
+    if [ "$RESETPROP_SET" -eq 0 ]; then
+        log "WARN: Unable to set ro.bpf.kver_override (no resetprop tool available)"
     fi
 else
     log "ro.bpf.kver_override already correct ($CORRECT_KVER)"
 fi
 
-# ---- 5. Delete mainline_done to allow netbpfload to retry ----
-# netbpfload creates this marker after its first run. If BPF loading
-# failed, this marker prevents retries. We MUST delete it.
-if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
-    rm -rf /sys/fs/bpf/netd_shared/mainline_done 2>/dev/null
-    log "Deleted mainline_done marker"
-else
-    log "mainline_done not present (first boot or already cleaned)"
+# ---- 6. Set additional properties to help BPF loading ----
+RESETPROP_CMD=""
+if command -v resetprop_phh >/dev/null 2>&1; then
+    RESETPROP_CMD="resetprop_phh"
+elif command -v resetprop >/dev/null 2>&1; then
+    RESETPROP_CMD="resetprop"
+elif command -v magisk >/dev/null 2>&1; then
+    RESETPROP_CMD="magisk resetprop"
 fi
 
-# ---- 6. Set additional properties to help BPF loading ----
-if command -v resetprop_phh >/dev/null 2>&1; then
-    resetprop_phh persist.sys.nobpf false 2>/dev/null
-    resetprop_phh ro.net.stats 1 2>/dev/null
-    resetprop_phh persist.sys.netstats 1 2>/dev/null
-elif command -v magisk >/dev/null 2>&1; then
-    magisk resetprop persist.sys.nobpf false 2>/dev/null
-    magisk resetprop ro.net.stats 1 2>/dev/null
-    magisk resetprop persist.sys.netstats 1 2>/dev/null
+if [ -n "$RESETPROP_CMD" ]; then
+    $RESETPROP_CMD persist.sys.nobpf false 2>/dev/null
+    $RESETPROP_CMD ro.net.stats 1 2>/dev/null
+    $RESETPROP_CMD persist.sys.netstats 1 2>/dev/null
 fi
 log "Set helper properties"
 
@@ -97,46 +115,21 @@ log "Set helper properties"
 if [ -f /proc/sys/net/core/bpf_jit_enable ]; then
     echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null
     log "Enabled BPF JIT"
+else
+    log "BPF JIT sysctl not available (non-critical)"
 fi
 
-# ---- 8. Restart bpfloader service for a clean retry ----
-# Now that ro.bpf.kver_override is correct and mainline_done is deleted,
-# restarting bpfloader will make netbpfload re-run with the right settings.
-log "Restarting bpfloader for clean retry..."
-stop bpfloader 2>/dev/null
-sleep 1
-start bpfloader 2>/dev/null
-
-# Wait for bpfloader to finish (it's oneshot, so it will stop)
-WAIT=0
-while [ "$(getprop init.svc.bpfloader 2>/dev/null)" = "running" ] && [ "$WAIT" -lt 30 ]; do
-    sleep 1
-    WAIT=$((WAIT + 1))
-done
-log "bpfloader completed after ${WAIT}s (state: $(getprop init.svc.bpfloader 2>/dev/null))"
-
-# Extra settle for map creation
-sleep 3
-
-# ---- 9. Check results ----
+# ---- 8. Check results BEFORE restarting ----
 BPF_MAP="/sys/fs/bpf/netd_shared/map_netd_uid_stats_map"
 BPF_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
 
 if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-    log "SUCCESS: BPF maps present after retry!"
-    log "  uid_stats_map: present"
-    log "  uid_owner_map: present"
+    log "BPF maps already present (initial state)"
 else
-    log "BPF maps still missing after retry"
-    log "  uid_stats_map: $([ -e "$BPF_MAP" ] && echo present || echo absent)"
-    log "  uid_owner_map: $([ -e "$BPF_OWNER" ] && echo present || echo absent)"
-
-    # Log what IS in netd_shared for diagnostics
-    log "netd_shared contents:"
-    ls -la /sys/fs/bpf/netd_shared/ 2>/dev/null >> "$LOG"
+    log "BPF maps missing, will attempt retry via service.sh"
 fi
 
-# ---- 10. Log legacy interfaces for diagnostics ----
+# ---- 9. Log legacy interfaces for diagnostics ----
 if [ -f /proc/net/xt_qtaguid/stats ]; then
     log "xt_qtaguid: AVAILABLE"
 elif [ -c /dev/xt_qtaguid ]; then
@@ -151,7 +144,7 @@ else
     log "uid_stat: not found"
 fi
 
-# ---- 11. Log APEX and cgroup status ----
+# ---- 10. Log APEX and cgroup status ----
 if [ -d /apex/com.android.tethering ]; then
     log "Tethering APEX: mounted"
 else
@@ -164,18 +157,16 @@ else
     log "WARN: No cgroup mounts"
 fi
 
-# ---- 12. Record BPF capability for service.sh ----
+# ---- 11. Record BPF capability for service.sh ----
+# Improved logic: only 5.0+ supports cgroup_skb reliably
 BPF_CAPABLE=0
 if [ "$KMAJOR" -ge 5 ]; then
     BPF_CAPABLE=1
-elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -ge 15 ]; then
-    BPF_CAPABLE=1
-elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -ge 14 ]; then
-    # 4.14 may have partial BPF support
-    BPF_CAPABLE=1
+    log "BPF capable (kernel >= 5.0): YES"
+else
+    log "BPF capable (kernel < 5.0): Limited (cgroup_skb unlikely)"
 fi
 echo "$BPF_CAPABLE" > /data/local/tmp/.bpf_capable 2>/dev/null
-log "BPF capable (kernel assessment): $BPF_CAPABLE"
 
 # Record the correct kernel version for service.sh
 echo "$CORRECT_KVER" > /data/local/tmp/.bpf_kver 2>/dev/null

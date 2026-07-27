@@ -1,6 +1,6 @@
 id=netstats-fix
 name=Network Stats Fix (Universal GSI)
-version=v4.0
-versionCode=7
+version=v4.1
+versionCode=8
 author=Flint
-description=Fixes broken network traffic indicator and per-UID network stats on Android 12-16 GSIs. Correctly sets ro.bpf.kver_override to the actual kernel version, forces BPF reload by clearing mainline_done, falls back to xt_qtaguid/uid_stat on legacy kernels, and ensures interface-level stats as a minimum. Universal compatibility across EvoX, Infinity X, Axion, and other Treble GSIs.
+description=Fixes broken network traffic indicator and per-UID network stats on Android 12-16 GSIs. Now with improved BPF capability detection (kernel >= 5.0), proper legacy fallback handling, aggressive network_stats_enabled persistence, and enhanced cross-device compatibility for EvoX, Infinity X, Axion, and other Treble GSIs.

@@ -162,18 +162,18 @@ if [ "$BPF_STATS_OK" -eq 0 ]; then
         log "Repair 1: ro.bpf.kver_override already correct"
     fi
 
-    # ---- Repair 2: Delete mainline_done and restart bpfloader ----
+    # ---- Repair 2: Restart bpfloader (mainline_done deleted in post-fs-data) ----
     if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
         rm -rf /sys/fs/bpf/netd_shared/mainline_done 2>/dev/null
-        log "Repair 2: Deleted mainline_done"
+        log "Repair 2: Deleted stale mainline_done"
     fi
 
-    # Ensure BPF JIT is enabled
+    # Ensure BPF JIT is enabled if available
     if [ -f /proc/sys/net/core/bpf_jit_enable ]; then
         echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null
     fi
 
-    log "Repair 2: Restarting bpfloader..."
+    log "Repair 2: Restarting bpfloader (attempt 1)..."
     stop bpfloader 2>/dev/null
     sleep 2
     start bpfloader 2>/dev/null
@@ -237,76 +237,111 @@ if [ "$BPF_STATS_OK" -eq 0 ]; then
         if [ "$KVER_MAJOR" -lt 4 ] || { [ "$KVER_MAJOR" -eq 4 ] && [ "$KVER_MINOR" -lt 9 ]; }; then
             log "  Kernel $KVER is too old for any BPF support"
             log "  The APEX's netbpfload cannot load programs on this kernel"
-        elif [ "$KVER_MAJOR" -eq 4 ] && [ "$KVER_MINOR" -le 14 ]; then
+        elif [ "$KVER_MAJOR" -eq 4 ] && [ "$KVER_MINOR" -lt 15 ]; then
             log "  Kernel $KVER has limited BPF support"
-            log "  cgroup_skb may not be fully supported"
-            log "  Some BPF programs may still load (non-cgroup_skb types)"
+            log "  cgroup_skb not fully supported in kernel < 5.0"
+            log "  Interface-level stats will be used as fallback"
+        elif [ "$KVER_MAJOR" -eq 4 ] && [ "$KVER_MINOR" -le 19 ]; then
+            log "  Kernel $KVER should support BPF (4.15-4.19)"
+            log "  Check dmesg above for specific failure reasons"
         else
-            log "  Kernel $KVER should support BPF"
+            log "  Kernel $KVER should support full BPF (>= 5.0)"
             log "  Check dmesg above for specific failure reasons"
         fi
     fi
 
-    # ---- Final attempt: if BPF failed, try xt_qtaguid module ----
+    # ---- Final attempt: if BPF failed, diagnostics complete ----
     if [ "$BPF_STATS_OK" -eq 0 ]; then
-        log "Attempting xt_qtaguid module load..."
-
-        # Check if module exists anywhere
-        for MODPATH in /vendor/lib/modules /system/lib/modules /lib/modules; do
-            if [ -d "$MODPATH" ]; then
-                QTAG_MOD=$(find "$MODPATH" -name "xt_qtaguid*" -o -name "xt_qtaguid.ko" 2>/dev/null | head -1)
-                if [ -n "$QTAG_MOD" ]; then
-                    log "  Found xt_qtaguid module: $QTAG_MOD"
-                    insmod "$QTAG_MOD" 2>/dev/null
-                    if [ -f /proc/net/xt_qtaguid/stats ]; then
-                        HAS_XTAGUID=1
-                        log "  xt_qtaguid module loaded successfully!"
-                    fi
-                fi
-            fi
-        done
-
-        # Try modprobe as well
-        if [ "$HAS_XTAGUID" -eq 0 ]; then
-            modprobe xt_qtaguid 2>/dev/null
-            if [ -f /proc/net/xt_qtaguid/stats ]; then
-                HAS_XTAGUID=1
-                log "  xt_qtaguid loaded via modprobe"
-            fi
-        fi
-
-        if [ "$HAS_XTAGUID" -eq 0 ]; then
-            log "  xt_qtaguid module not available"
-        fi
+        log "Repair complete: BPF maps could not be loaded"
+        log "Continuing with legacy fallback in Phase 3..."
     fi
 fi
 
 # ============================================================
-# PHASE 3: ENSURE SETTINGS
+# PHASE 3: LEGACY FALLBACK
 # ============================================================
-log "--- Phase 3: Settings ---"
+log "--- Phase 3: Legacy Fallback ---"
 
-# Ensure properties are set correctly
+# Check for legacy per-UID interfaces
+if [ "$BPF_STATS_OK" -eq 0 ]; then
+    # xt_qtaguid is the primary legacy fallback
+    if [ "$HAS_XTAGUID" -eq 0 ]; then
+        log "Fallback: Attempting xt_qtaguid module load..."
+        QTAG_FOUND=0
+        
+        # Check if module exists anywhere
+        for MODPATH in /vendor/lib/modules /system/lib/modules /lib/modules; do
+            if [ -d "$MODPATH" ]; then
+                QTAG_MOD=$(find "$MODPATH" -name "*xt_qtaguid*" 2>/dev/null | head -1)
+                if [ -n "$QTAG_MOD" ]; then
+                    log "  Found xt_qtaguid module: $QTAG_MOD"
+                    insmod "$QTAG_MOD" 2>/dev/null
+                    sleep 1
+                    if [ -f /proc/net/xt_qtaguid/stats ]; then
+                        HAS_XTAGUID=1
+                        QTAG_FOUND=1
+                        log "  xt_qtaguid module loaded successfully!"
+                        break
+                    fi
+                fi
+            fi
+        done
+        
+        # Try modprobe as well
+        if [ "$QTAG_FOUND" -eq 0 ]; then
+            if modprobe xt_qtaguid 2>/dev/null; then
+                sleep 1
+                if [ -f /proc/net/xt_qtaguid/stats ]; then
+                    HAS_XTAGUID=1
+                    log "  xt_qtaguid loaded via modprobe"
+                fi
+            fi
+        fi
+        
+        if [ "$HAS_XTAGUID" -eq 0 ]; then
+            log "  xt_qtaguid module not available"
+        fi
+    fi
+    
+    # uid_stat is secondary fallback
+    if [ "$HAS_UIDSTAT" -eq 0 ] && [ -d /proc/uid_stat ]; then
+        HAS_UIDSTAT=1
+        log "Fallback: uid_stat available"
+    fi
+fi
+
+# Determine which fallback is in use
+if [ "$BPF_STATS_OK" -eq 0 ]; then
+    if [ "$HAS_XTAGUID" -ge 1 ]; then
+        log "Fallback method: xt_qtaguid (per-UID)"
+    elif [ "$HAS_UIDSTAT" -eq 1 ]; then
+        log "Fallback method: uid_stat (per-UID TCP)"
+    else
+        log "Fallback method: none (interface-level only)"
+    fi
+fi
+
+# ============================================================
+# PHASE 4: SETTINGS
+# ============================================================
+log "--- Phase 4: Settings ---"
+
+# Ensure properties are set correctly via all available methods
+RESETPROP_CMD=""
 if command -v resetprop_phh >/dev/null 2>&1; then
-    resetprop_phh persist.sys.nobpf false 2>/dev/null
-    resetprop_phh ro.net.stats 1 2>/dev/null
-    resetprop_phh persist.sys.netstats 1 2>/dev/null
-    if [ "$BPF_STATS_OK" -eq 0 ] && [ "$HAS_XTAGUID" -ge 1 ]; then
-        resetprop_phh net.qtaguid_enabled 1 2>/dev/null
-    fi
+    RESETPROP_CMD="resetprop_phh"
 elif command -v resetprop >/dev/null 2>&1; then
-    resetprop persist.sys.nobpf false 2>/dev/null
-    resetprop ro.net.stats 1 2>/dev/null
-    resetprop persist.sys.netstats 1 2>/dev/null
-    if [ "$BPF_STATS_OK" -eq 0 ] && [ "$HAS_XTAGUID" -ge 1 ]; then
-        resetprop net.qtaguid_enabled 1 2>/dev/null
-    fi
+    RESETPROP_CMD="resetprop"
 elif command -v magisk >/dev/null 2>&1; then
-    magisk resetprop persist.sys.nobpf false 2>/dev/null
-    magisk resetprop ro.net.stats 1 2>/dev/null
-    magisk resetprop persist.sys.netstats 1 2>/dev/null
+    RESETPROP_CMD="magisk resetprop"
+fi
+
+if [ -n "$RESETPROP_CMD" ]; then
+    $RESETPROP_CMD persist.sys.nobpf false 2>/dev/null
+    $RESETPROP_CMD ro.net.stats 1 2>/dev/null
+    $RESETPROP_CMD persist.sys.netstats 1 2>/dev/null
     if [ "$BPF_STATS_OK" -eq 0 ] && [ "$HAS_XTAGUID" -ge 1 ]; then
-        magisk resetprop net.qtaguid_enabled 1 2>/dev/null
+        $RESETPROP_CMD net.qtaguid_enabled 1 2>/dev/null
     fi
 fi
 log "Properties applied"
@@ -317,31 +352,47 @@ setprop ctl.restart netd 2>/dev/null
 sleep 10
 log "netd state: $(getprop init.svc.netd 2>/dev/null)"
 
-# Set network_stats_enabled with retry
-log "Setting network_stats_enabled=1..."
-for i in 1 2 3 4 5; do
+# Set network_stats_enabled with aggressive retry (FIX for Infinity X issue)
+log "Setting network_stats_enabled=1 with validation..."
+ATTEMPT=0
+MAX_ATTEMPTS=8
+while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
+    ATTEMPT=$((ATTEMPT + 1))
     settings put global network_stats_enabled 1 2>/dev/null
-    sleep 2
+    sleep 1
+    
     NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
     if [ "$NSE_NOW" = "1" ]; then
-        log "network_stats_enabled confirmed (attempt $i)"
+        log "network_stats_enabled=1 confirmed (attempt $ATTEMPT)"
         break
+    elif [ -n "$NSE_NOW" ]; then
+        log "  attempt $ATTEMPT: got '$NSE_NOW' (expected '1'), retrying..."
+    else
+        log "  attempt $ATTEMPT: got empty/null, retrying..."
     fi
-    log "  attempt $i: ${NSE_NOW:-empty}, retrying..."
+    
+    # Wait longer between attempts
+    sleep 2
 done
 
-# Final NSE check
-NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
-if [ "$NSE_NOW" != "1" ]; then
-    log "WARN: network_stats_enabled still not 1, trying content provider..."
-    content call --uri content://settings/global --method PUT \
-        --arg network_stats_enabled --extra value:s:1 2>/dev/null
-    sleep 3
-    NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
-    log "network_stats_enabled (content provider): ${NSE_NOW:-empty}"
+# Final validation
+NSE_FINAL=$(settings get global network_stats_enabled 2>/dev/null)
+if [ "$NSE_FINAL" = "1" ]; then
+    log "SUCCESS: network_stats_enabled=1 (final: $NSE_FINAL)"
+else
+    log "WARN: network_stats_enabled not 1 (final: $NSE_FINAL), trying alternatives..."
+    
+    # Try via content provider
+    if command -v content >/dev/null 2>&1; then
+        content call --uri content://settings/global --method PUT \
+            --arg network_stats_enabled --extra value:s:1 2>/dev/null
+        sleep 2
+        NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
+        log "network_stats_enabled after content provider: $NSE_NOW"
+    fi
 fi
 
-# Force NetworkStatsService to refresh stats (SAFE method, no SIGHUP)
+# Force NetworkStatsService to refresh stats
 log "Refreshing NetworkStatsService..."
 if cmd netstats force-refresh 2>/dev/null; then
     log "  cmd netstats force-refresh: success"
@@ -350,114 +401,141 @@ else
 fi
 
 # ============================================================
-# PHASE 4: FINAL VERIFICATION
+# PHASE 5: VERIFICATION & DIAGNOSTICS
 # ============================================================
-log "--- Phase 4: Verification ---"
+log "--- Phase 5: Verification & Diagnostics ---"
 
 FINAL_BPF=0
 if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
     FINAL_BPF=1
+    log "FINAL BPF maps: PRESENT"
+else
+    log "FINAL BPF maps: absent"
 fi
 
 FINAL_XTAGUID=0
 if [ -f /proc/net/xt_qtaguid/stats ]; then
     FINAL_XTAGUID=1
+    XTAGUID_LINES=$(wc -l < /proc/net/xt_qtaguid/stats 2>/dev/null || echo "?")
+    log "FINAL xt_qtaguid: AVAILABLE ($XTAGUID_LINES lines)"
 fi
 
 FINAL_UIDSTAT=0
 if [ -d /proc/uid_stat ]; then
     FINAL_UIDSTAT=1
+    UIDSTAT_COUNT=$(ls /proc/uid_stat/ 2>/dev/null | wc -l)
+    log "FINAL uid_stat: AVAILABLE ($UIDSTAT_COUNT UIDs)"
 fi
 
 FINAL_NSE=$(settings get global network_stats_enabled 2>/dev/null)
-
-log "FINAL BPF maps: $([ "$FINAL_BPF" -eq 1 ] && echo PRESENT || echo absent)"
-log "FINAL xt_qtaguid: $([ "$FINAL_XTAGUID" -eq 1 ] && echo AVAILABLE || echo absent)"
-log "FINAL uid_stat: $([ "$FINAL_UIDSTAT" -eq 1 ] && echo AVAILABLE || echo absent)"
-log "FINAL network_stats_enabled: ${FINAL_NSE:-empty}"
+log "FINAL network_stats_enabled: $FINAL_NSE"
 log "FINAL ro.bpf.kver_override: $(getprop ro.bpf.kver_override 2>/dev/null)"
 
 log ""
 log "============================================"
+log "DIAGNOSTIC SUMMARY:"
+log "============================================"
 
 if [ "$FINAL_BPF" -eq 1 ]; then
-    log "RESULT: BPF maps PRESENT"
-    log "Per-UID traffic stats are WORKING."
-    log "Traffic indicator should show per-app traffic."
+    log "✓ BPF per-UID stats: WORKING"
 elif [ "$FINAL_XTAGUID" -eq 1 ]; then
-    log "RESULT: xt_qtaguid AVAILABLE"
-    log "Per-UID stats available via legacy fallback."
-    log "Traffic indicator should show per-app traffic."
+    log "✓ xt_qtaguid per-UID stats: WORKING (legacy)"
 elif [ "$FINAL_UIDSTAT" -eq 1 ]; then
-    log "RESULT: uid_stat AVAILABLE"
-    log "Per-UID TCP stats available."
-    log "Traffic indicator may show per-app traffic."
+    log "◐ uid_stat per-UID TCP stats: AVAILABLE (limited)"
 else
-    log "RESULT: No per-UID stats source available"
+    log "✗ Per-UID stats: NOT AVAILABLE"
+fi
+
+if [ "$FINAL_NSE" = "1" ]; then
+    log "✓ Interface-level stats: ENABLED"
+else
+    log "✗ Interface-level stats: DISABLED (got: $FINAL_NSE)"
+fi
+
+# Overall assessment
+if [ "$FINAL_BPF" -eq 1 ] || [ "$FINAL_XTAGUID" -eq 1 ]; then
     log ""
-    log "This kernel ($(uname -r)) cannot support BPF-based"
-    log "per-UID network stats, and no legacy fallback exists."
+    log "RESULT: PER-UID STATS ARE AVAILABLE"
+    log "Traffic indicator should show per-app traffic."
+elif [ "$FINAL_NSE" = "1" ]; then
     log ""
-    log "Interface-level stats are active (network_stats_enabled=1)."
-    log "The traffic indicator will show TOTAL traffic per interface."
+    log "RESULT: PARTIAL (interface-level only)"
+    log "Traffic indicator will show total traffic per interface."
+    log "Per-app traffic will not be visible."
     log ""
-    log "POSSIBLE SOLUTIONS:"
-    log "1. Flash a ROM with kernel >= 5.4 (full BPF support)"
-    log "2. Check if xt_qtaguid module can be compiled for this kernel"
-    log "3. Use a different GSI with kernel >= 5.10"
+    log "RECOMMENDED FIXES:"
+    log "  1. Flash a ROM with kernel >= 5.4"
+    log "  2. Compile xt_qtaguid module for this kernel"
+    log "  3. Check with your device maintainer for BPF support"
+else
+    log ""
+    log "RESULT: STATS COLLECTION DISABLED"
+    log "Traffic indicator will not work."
 fi
 
 log "============================================"
 
 # ============================================================
-# PHASE 5: WATCHDOG
+# PHASE 6: WATCHDOG (persistent monitoring)
 # ============================================================
-
-log "=== Watchdog started (every 5 min) ==="
+log ""
+log "=== WATCHDOG STARTED (monitoring interval: 5 min) ==="
 WATCHDOG_COUNT=0
+
 while true; do
     sleep 300
     WATCHDOG_COUNT=$((WATCHDOG_COUNT + 1))
-
-    # Re-verify network_stats_enabled
-    NSE=$(settings get global network_stats_enabled 2>/dev/null)
-    if [ "$NSE" != "1" ]; then
+    
+    # Verify critical setting
+    NSE_CHECK=$(settings get global network_stats_enabled 2>/dev/null)
+    if [ "$NSE_CHECK" != "1" ]; then
         settings put global network_stats_enabled 1 2>/dev/null
-        log "Watchdog [$WATCHDOG_COUNT]: corrected network_stats_enabled"
+        log "[WD-$WATCHDOG_COUNT] Corrected network_stats_enabled (was: $NSE_CHECK)"
     fi
-
-    # If BPF maps exist, check they're still there
+    
+    # Verify BPF maps if they were working
     if [ "$FINAL_BPF" -eq 1 ]; then
         if [ ! -e "$BPF_MAP" ] || [ ! -e "$BPF_OWNER" ]; then
-            log "Watchdog [$WATCHDOG_COUNT]: BPF maps LOST! Restarting bpfloader..."
+            log "[WD-$WATCHDOG_COUNT] WARNING: BPF maps lost! Attempting recovery..."
             rm -rf /sys/fs/bpf/netd_shared/mainline_done 2>/dev/null
             stop bpfloader 2>/dev/null
-            sleep 1
+            sleep 2
             start bpfloader 2>/dev/null
-            sleep 10
+            
+            WAIT=0
+            while [ "$(getprop init.svc.bpfloader 2>/dev/null)" = "running" ] && [ "$WAIT" -lt 20 ]; do
+                sleep 1
+                WAIT=$((WAIT + 1))
+            done
+            sleep 2
+            
             if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-                log "Watchdog [$WATCHDOG_COUNT]: BPF maps restored"
+                log "[WD-$WATCHDOG_COUNT] BPF maps restored successfully"
             else
-                log "Watchdog [$WATCHDOG_COUNT]: BPF maps still missing"
+                log "[WD-$WATCHDOG_COUNT] BPF maps recovery failed"
+                FINAL_BPF=0
             fi
         fi
     fi
-
-    # Periodic stats refresh
-    if [ "$((WATCHDOG_COUNT % 6))" -eq 0 ]; then
-        cmd netstats force-refresh 2>/dev/null
-        log "Watchdog [$WATCHDOG_COUNT]: periodic stats refresh"
+    
+    # Periodic statistics refresh
+    if [ "$(($WATCHDOG_COUNT % 6))" -eq 0 ]; then
+        if cmd netstats force-refresh 2>/dev/null; then
+            :  # silent success
+        fi
     fi
-
-    # Light status log
-    NBPF=$([ -e "$BPF_MAP" ] && echo P || echo A)
-    NNETD=$(getprop init.svc.netd 2>/dev/null)
-    NSE=$(settings get global network_stats_enabled 2>/dev/null)
-    log "Watchdog [$WATCHDOG_COUNT]: BPF=$NBPF netd=$NNETD NSE=$NSE"
-
-    # If BPF maps suddenly appeared (e.g., after kernel module load)
-    if [ "$FINAL_BPF" -eq 0 ] && [ "$NBPF" = "P" ]; then
-        log "Watchdog [$WATCHDOG_COUNT]: BPF maps appeared! System now has per-UID stats."
+    
+    # Lightweight status log (every 6 cycles = 30 min)
+    if [ "$(($WATCHDOG_COUNT % 6))" -eq 0 ]; then
+        NBPF=$([ -e "$BPF_MAP" ] && echo "P" || echo "A")
+        NNETD=$(getprop init.svc.netd 2>/dev/null | cut -c1-3)
+        NSE=$(settings get global network_stats_enabled 2>/dev/null)
+        log "[WD-$WATCHDOG_COUNT] Status: BPF=$NBPF netd=$NNETD NSE=$NSE"
+    fi
+    
+    # Detect if BPF maps appeared after a kernel module was loaded
+    if [ "$FINAL_BPF" -eq 0 ] && [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
+        log "[WD-$WATCHDOG_COUNT] BPF maps detected! System now has full per-UID stats."
         FINAL_BPF=1
     fi
 done
