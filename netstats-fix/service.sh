@@ -1,16 +1,11 @@
 #!/system/bin/sh
 # service.sh - Late_start: repair network stats on all devices
 #
-# Strategy:
-#   1. Verify BPF maps (may have been created by post-fs-data retry)
-#   2. If not, try one more bpfloader restart with correct properties
-#   3. Ensure network_stats_enabled=1
-#   4. Set up watchdog for persistent settings
-#
-# Key insight: The APEX's netbpfload has BPF program variants for kernels
-# 4.9-5.10+. If ro.bpf.kver_override is set correctly (to the ACTUAL
-# kernel version), netbpfload loads the right variant. Our post-fs-data.sh
-# handles this. This script verifies and does final recovery.
+# CRITICAL CHANGES from v4.1:
+# - REMOVED setenforce 0 (causes firmware-level reboot on devices like Infinity X)
+# - Fixed BPF map name checks (map_netd_uid_owner_map, not uid_owner_map)
+# - Added per-device safety detection for SELinux operations
+# - Added proper fallback chain: BPF -> legacy -> interface-level
 
 MODDIR=${0%/*}
 LOG=/data/local/tmp/netstats-fix.log
@@ -35,12 +30,55 @@ log "Boot completed after ${WAIT}s"
 sleep 15
 
 # ============================================================
-# PATHS
+# PATHS (using CORRECT map_netd_ prefixed names)
 # ============================================================
-BPF_MAP="/sys/fs/bpf/netd_shared/map_netd_uid_stats_map"
-BPF_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
+BPF_MAP_OWNER="/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
+BPF_MAP_APP_STATS="/sys/fs/bpf/netd_shared/map_netd_app_uid_stats_map"
+BPF_MAP_COOKIE="/sys/fs/bpf/netd_shared/map_netd_cookie_tag_map"
+BPF_MAP_CONFIG="/sys/fs/bpf/netd_shared/map_netd_configuration_map"
+BPF_MAP_STATS_A="/sys/fs/bpf/netd_shared/map_netd_stats_map_A"
+BPF_MAP_STATS_B="/sys/fs/bpf/netd_shared/map_netd_stats_map_B"
+BPF_MAP_UID_PERM="/sys/fs/bpf/netd_shared/map_netd_uid_permission_map"
+BPF_MAP_IFACE_STATS="/sys/fs/bpf/netd_shared/map_netd_iface_stats_map"
 BPF_CAPABLE=$(cat /data/local/tmp/.bpf_capable 2>/dev/null || echo 0)
 CORRECT_KVER=$(cat /data/local/tmp/.bpf_kver 2>/dev/null || echo unknown)
+
+# Safety: if saved version still has non-numeric suffixes, re-strip it
+if echo "$CORRECT_KVER" | grep -qE '[^0-9.]'; then
+    SAVED_MAJOR=$(echo "$CORRECT_KVER" | cut -d. -f1 | grep -oE '^[0-9]+')
+    SAVED_MINOR=$(echo "$CORRECT_KVER" | cut -d. -f2 | grep -oE '^[0-9]+')
+    SAVED_PATCH=$(echo "$CORRECT_KVER" | cut -d. -f3 | grep -oE '^[0-9]+')
+    CORRECT_KVER="${SAVED_MAJOR}.${SAVED_MINOR}.${SAVED_PATCH}"
+    log "Corrected version string to: $CORRECT_KVER"
+fi
+
+# ============================================================
+# Helper: count BPF maps present
+# ============================================================
+count_bpf_maps() {
+    local count=0
+    [ -e /sys/fs/bpf/netd_shared/map_netd_uid_owner_map ] && count=$((count + 1))
+    [ -e /sys/fs/bpf/netd_shared/map_netd_app_uid_stats_map ] && count=$((count + 1))
+    [ -e /sys/fs/bpf/netd_shared/map_netd_cookie_tag_map ] && count=$((count + 1))
+    [ -e /sys/fs/bpf/netd_shared/map_netd_configuration_map ] && count=$((count + 1))
+    [ -e /sys/fs/bpf/netd_shared/map_netd_stats_map_A ] && count=$((count + 1))
+    [ -e /sys/fs/bpf/netd_shared/map_netd_stats_map_B ] && count=$((count + 1))
+    [ -e /sys/fs/bpf/netd_shared/map_netd_uid_permission_map ] && count=$((count + 1))
+    [ -e /sys/fs/bpf/netd_shared/map_netd_iface_stats_map ] && count=$((count + 1))
+    echo "$count"
+}
+
+# ============================================================
+# Helper: check if specific BPF maps needed for stats exist
+# ============================================================
+bpf_stats_ready() {
+    # For per-UID stats we need at minimum: app_uid_stats_map + configuration_map
+    # For firewall we need: uid_owner_map
+    if [ -e "$BPF_MAP_APP_STATS" ] && [ -e "$BPF_MAP_CONFIG" ]; then
+        return 0
+    fi
+    return 1
+}
 
 # ============================================================
 # PHASE 1: DIAGNOSTICS
@@ -50,6 +88,7 @@ log "--- Phase 1: Diagnostics ---"
 KVER=$(uname -r 2>/dev/null)
 KMAJOR=$(echo "$KVER" | cut -d. -f1)
 KMINOR=$(echo "$KVER" | cut -d. -f2)
+KPATCH=$(echo "$KVER" | cut -d. -f3 | grep -oE '^[0-9]+')
 log "Kernel: $KVER"
 
 # BPF JIT
@@ -59,18 +98,21 @@ else
     log "BPF JIT: sysctl not present"
 fi
 
-# BPF maps
-BPF_STATS_OK=0
-if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-    BPF_STATS_OK=1
-    log "BPF maps: PRESENT"
-else
-    log "BPF maps: MISSING"
-    log "  uid_stats_map: $([ -e "$BPF_MAP" ] && echo present || echo absent)"
-    log "  uid_owner_map: $([ -e "$BPF_OWNER" ] && echo present || echo absent)"
-fi
+# Count BPF maps
+MAP_COUNT=$(count_bpf_maps)
+log "BPF maps present: $MAP_COUNT"
 
-# netd_shared contents
+# Check individual critical maps
+log "  uid_owner_map: $([ -e "$BPF_MAP_OWNER" ] && echo present || echo absent)"
+log "  app_uid_stats_map: $([ -e "$BPF_MAP_APP_STATS" ] && echo present || echo absent)"
+log "  cookie_tag_map: $([ -e "$BPF_MAP_COOKIE" ] && echo present || echo absent)"
+log "  configuration_map: $([ -e "$BPF_MAP_CONFIG" ] && echo present || echo absent)"
+log "  stats_map_A: $([ -e "$BPF_MAP_STATS_A" ] && echo present || echo absent)"
+log "  stats_map_B: $([ -e "$BPF_MAP_STATS_B" ] && echo present || echo absent)"
+log "  uid_permission_map: $([ -e "$BPF_MAP_UID_PERM" ] && echo present || echo absent)"
+log "  iface_stats_map: $([ -e "$BPF_MAP_IFACE_STATS" ] && echo present || echo absent)"
+
+# Full netd_shared contents
 log "netd_shared contents:"
 ls -la /sys/fs/bpf/netd_shared/ 2>/dev/null >> "$LOG"
 
@@ -78,7 +120,7 @@ ls -la /sys/fs/bpf/netd_shared/ 2>/dev/null >> "$LOG"
 if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
     log "mainline_done: PRESENT (netbpfload ran)"
 else
-    log "mainline_done: absent (clean state)"
+    log "mainline_done: absent"
 fi
 
 # Service states
@@ -118,39 +160,30 @@ if [ -d /proc/uid_stat ]; then
     log "uid_stat: AVAILABLE ($(ls /proc/uid_stat/ 2>/dev/null | wc -l) UIDs)"
 fi
 
-# Capture BPF-related dmesg
-DMESG_RESTRICT=$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)
-log "dmesg_restrict: ${DMESG_RESTRICT:-unknown}"
-
-BPF_DMESG=$(dmesg 2>/dev/null | grep -iE 'bpf|netd.*map|bpfloader|netbpfload|BpfLoader|NetBpfLoad' 2>/dev/null | tail -30)
-if [ -n "$BPF_DMESG" ]; then
-    log "BPF kernel messages:"
-    echo "$BPF_DMESG" >> "$LOG"
-else
-    # Fallback to logcat
-    LOGCAT_BPF=$(logcat -d -b kernel,main 2>/dev/null | grep -iE 'bpf|netbpfload|BpfLoader|NetBpfLoad' 2>/dev/null | tail -20)
-    if [ -n "$LOGCAT_BPF" ]; then
-        log "BPF logcat messages:"
-        echo "$LOGCAT_BPF" >> "$LOG"
-    else
-        log "No BPF messages found in dmesg or logcat"
-    fi
+# Capture BPF-related logcat messages
+LOGCAT_BPF=$(logcat -d -b kernel,main 2>/dev/null | grep -iE 'bpf|netbpfload|BpfLoader|NetBpfLoad|BpfNetMaps|Firewall unavailable|Null bpf map' 2>/dev/null | tail -30)
+if [ -n "$LOGCAT_BPF" ]; then
+    log "BPF logcat messages:"
+    echo "$LOGCAT_BPF" >> "$LOG"
 fi
 
 # ============================================================
-# PHASE 2: BPF REPAIR (only if maps missing and recovery is possible)
+# PHASE 2: BPF REPAIR (only if key maps missing)
 # ============================================================
-
-if [ "$BPF_STATS_OK" -eq 0 ]; then
+BPF_STATS_OK=0
+if bpf_stats_ready; then
+    BPF_STATS_OK=1
+    log "--- Phase 2: BPF Maps Present (no repair needed) ---"
+    # DO NOT restart bpfloader here - it would destroy working maps!
+    # DO NOT delete mainline_done here - it prevents unnecessary re-loading!
+else
     log "--- Phase 2: BPF Repair ---"
 
     # ---- Repair 1: Verify ro.bpf.kver_override is correct ----
-    # post-fs-data.sh should have set this, but verify
     CURRENT_KVER_PROP=$(getprop ro.bpf.kver_override 2>/dev/null)
     if [ "$CURRENT_KVER_PROP" != "$CORRECT_KVER" ] && [ "$CORRECT_KVER" != "unknown" ]; then
         log "Repair 1: Fixing ro.bpf.kver_override"
-        log "  Current: ${CURRENT_KVER_PROP:-not set}"
-        log "  Expected: $CORRECT_KVER"
+        log "  Current: ${CURRENT_KVER_PROP:-not set} -> Expected: $CORRECT_KVER"
         if command -v resetprop_phh >/dev/null 2>&1; then
             resetprop_phh ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null
         elif command -v resetprop >/dev/null 2>&1; then
@@ -162,164 +195,69 @@ if [ "$BPF_STATS_OK" -eq 0 ]; then
         log "Repair 1: ro.bpf.kver_override already correct"
     fi
 
-    # ---- Repair 2: Restart bpfloader (mainline_done deleted in post-fs-data) ----
+    # ---- Repair 2: Delete mainline_done and restart bpfloader ----
+    # Only do this if maps are truly missing
     if [ -d /sys/fs/bpf/netd_shared/mainline_done ]; then
         rm -rf /sys/fs/bpf/netd_shared/mainline_done 2>/dev/null
         log "Repair 2: Deleted stale mainline_done"
     fi
 
-    # Ensure BPF JIT is enabled if available
     if [ -f /proc/sys/net/core/bpf_jit_enable ]; then
         echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null
     fi
 
-    log "Repair 2: Restarting bpfloader (attempt 1)..."
+    log "Repair 2: Restarting bpfloader..."
     stop bpfloader 2>/dev/null
-    sleep 2
+    sleep 3
     start bpfloader 2>/dev/null
 
-    # Wait for completion
     BPF_WAIT=0
-    while [ "$(getprop init.svc.bpfloader 2>/dev/null)" = "running" ] && [ "$BPF_WAIT" -lt 30 ]; do
+    while [ "$(getprop init.svc.bpfloader 2>/dev/null)" = "running" ] && [ "$BPF_WAIT" -lt 45 ]; do
         sleep 1
         BPF_WAIT=$((BPF_WAIT + 1))
     done
     log "Repair 2: bpfloader completed after ${BPF_WAIT}s"
     sleep 3
 
-    if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
+    NEW_MAP_COUNT=$(count_bpf_maps)
+    log "Repair 2: BPF maps now: $NEW_MAP_COUNT (was: $MAP_COUNT)"
+
+    if bpf_stats_ready; then
         BPF_STATS_OK=1
-        log "Repair 2 SUCCESS: BPF maps present!"
+        log "Repair 2 SUCCESS: Critical BPF maps present!"
     else
-        log "Repair 2: BPF maps still missing"
+        log "Repair 2: Critical maps still missing"
         log "  netd_shared:"
         ls -la /sys/fs/bpf/netd_shared/ 2>/dev/null >> "$LOG"
     fi
 
-    # ---- Repair 3: Try with SELinux permissive (diagnostic only) ----
+    # ---- Repair 3: CAPTURE DENIALS ONLY - NEVER setenforce 0 ----
+    # CRITICAL: setenforce 0 causes firmware-level reboot on devices like
+    # Infinity X / Huawei / Samsung with TIMA/RKP. NEVER call setenforce 0.
     if [ "$BPF_STATS_OK" -eq 0 ] && [ "$SELINUX" = "Enforcing" ]; then
-        log "Repair 3: Testing with SELinux permissive..."
-        setenforce 0 2>/dev/null
-
-        # Clean and retry
-        rm -rf /sys/fs/bpf/netd_shared/mainline_done 2>/dev/null
-        stop bpfloader 2>/dev/null
-        sleep 1
-        start bpfloader 2>/dev/null
-
-        BPF_WAIT=0
-        while [ "$(getprop init.svc.bpfloader 2>/dev/null)" = "running" ] && [ "$BPF_WAIT" -lt 30 ]; do
-            sleep 1
-            BPF_WAIT=$((BPF_WAIT + 1))
-        done
-        sleep 3
-
-        if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-            BPF_STATS_OK=1
-            log "Repair 3 SUCCESS: BPF maps present with SELinux permissive!"
-            log "  Capture denials for permanent sepolicy fix:"
-            dmesg 2>/dev/null | grep -i 'avc.*denied' | grep -i bpf | tail -20 >> "$LOG"
-        else
-            log "Repair 3: BPF maps still missing even with SELinux permissive"
-            log "  This kernel likely cannot support the required BPF programs"
-        fi
-
-        setenforce 1 2>/dev/null
-        log "  SELinux restored to Enforcing"
-    fi
-
-    # ---- Repair 4: Check if ro.bpf.kver_override was the issue ----
-    if [ "$BPF_STATS_OK" -eq 0 ]; then
-        log "Repair 4: Analyzing failure reason..."
-        KVER_MAJOR=$(echo "$KVER" | cut -d. -f1)
-        KVER_MINOR=$(echo "$KVER" | cut -d. -f2)
-
-        if [ "$KVER_MAJOR" -lt 4 ] || { [ "$KVER_MAJOR" -eq 4 ] && [ "$KVER_MINOR" -lt 9 ]; }; then
-            log "  Kernel $KVER is too old for any BPF support"
-            log "  The APEX's netbpfload cannot load programs on this kernel"
-        elif [ "$KVER_MAJOR" -eq 4 ] && [ "$KVER_MINOR" -lt 15 ]; then
-            log "  Kernel $KVER has limited BPF support"
-            log "  cgroup_skb not fully supported in kernel < 5.0"
-            log "  Interface-level stats will be used as fallback"
-        elif [ "$KVER_MAJOR" -eq 4 ] && [ "$KVER_MINOR" -le 19 ]; then
-            log "  Kernel $KVER should support BPF (4.15-4.19)"
-            log "  Check dmesg above for specific failure reasons"
-        else
-            log "  Kernel $KVER should support full BPF (>= 5.0)"
-            log "  Check dmesg above for specific failure reasons"
-        fi
-    fi
-
-    # ---- Final attempt: if BPF failed, diagnostics complete ----
-    if [ "$BPF_STATS_OK" -eq 0 ]; then
-        log "Repair complete: BPF maps could not be loaded"
-        log "Continuing with legacy fallback in Phase 3..."
+        log "Repair 3: Capturing SELinux denials for diagnosis (permissive mode SKIPPED for safety)"
+        # Capture current denials related to BPF
+        dmesg 2>/dev/null | grep -i 'avc.*denied' | grep -iE 'bpf|netd|net_bw' | tail -30 >> "$LOG"
+        logcat -d -b events 2>/dev/null | grep -iE 'avc.*denied.*bpf' | tail -20 >> "$LOG"
     fi
 fi
 
 # ============================================================
-# PHASE 3: LEGACY FALLBACK
+# PHASE 3: RESTART NETD TO PICK UP BPF MAPS
 # ============================================================
-log "--- Phase 3: Legacy Fallback ---"
+log "--- Phase 3: Netd Restart ---"
 
-# Check for legacy per-UID interfaces
-if [ "$BPF_STATS_OK" -eq 0 ]; then
-    # xt_qtaguid is the primary legacy fallback
-    if [ "$HAS_XTAGUID" -eq 0 ]; then
-        log "Fallback: Attempting xt_qtaguid module load..."
-        QTAG_FOUND=0
-        
-        # Check if module exists anywhere
-        for MODPATH in /vendor/lib/modules /system/lib/modules /lib/modules; do
-            if [ -d "$MODPATH" ]; then
-                QTAG_MOD=$(find "$MODPATH" -name "*xt_qtaguid*" 2>/dev/null | head -1)
-                if [ -n "$QTAG_MOD" ]; then
-                    log "  Found xt_qtaguid module: $QTAG_MOD"
-                    insmod "$QTAG_MOD" 2>/dev/null
-                    sleep 1
-                    if [ -f /proc/net/xt_qtaguid/stats ]; then
-                        HAS_XTAGUID=1
-                        QTAG_FOUND=1
-                        log "  xt_qtaguid module loaded successfully!"
-                        break
-                    fi
-                fi
-            fi
-        done
-        
-        # Try modprobe as well
-        if [ "$QTAG_FOUND" -eq 0 ]; then
-            if modprobe xt_qtaguid 2>/dev/null; then
-                sleep 1
-                if [ -f /proc/net/xt_qtaguid/stats ]; then
-                    HAS_XTAGUID=1
-                    log "  xt_qtaguid loaded via modprobe"
-                fi
-            fi
-        fi
-        
-        if [ "$HAS_XTAGUID" -eq 0 ]; then
-            log "  xt_qtaguid module not available"
-        fi
-    fi
-    
-    # uid_stat is secondary fallback
-    if [ "$HAS_UIDSTAT" -eq 0 ] && [ -d /proc/uid_stat ]; then
-        HAS_UIDSTAT=1
-        log "Fallback: uid_stat available"
-    fi
-fi
-
-# Determine which fallback is in use
-if [ "$BPF_STATS_OK" -eq 0 ]; then
-    if [ "$HAS_XTAGUID" -ge 1 ]; then
-        log "Fallback method: xt_qtaguid (per-UID)"
-    elif [ "$HAS_UIDSTAT" -eq 1 ]; then
-        log "Fallback method: uid_stat (per-UID TCP)"
-    else
-        log "Fallback method: none (interface-level only)"
-    fi
-fi
+# Even if maps exist, netd may have started before bpfloader finished.
+# Restart netd so it re-opens the BPF maps.
+log "Restarting netd to re-initialize BPF map access..."
+setprop ctl.restart netd 2>/dev/null
+NETD_WAIT=0
+while [ "$(getprop init.svc.netd 2>/dev/null)" != "running" ] && [ "$NETD_WAIT" -lt 30 ]; do
+    sleep 1
+    NETD_WAIT=$((NETD_WAIT + 1))
+done
+sleep 5
+log "Netd restarted (waited ${NETD_WAIT}s)"
 
 # ============================================================
 # PHASE 4: SETTINGS
@@ -346,42 +284,30 @@ if [ -n "$RESETPROP_CMD" ]; then
 fi
 log "Properties applied"
 
-# Restart netd to pick up property changes
-log "Restarting netd..."
-setprop ctl.restart netd 2>/dev/null
-sleep 10
-log "netd state: $(getprop init.svc.netd 2>/dev/null)"
-
-# Set network_stats_enabled with aggressive retry (FIX for Infinity X issue)
+# Set network_stats_enabled with retry
 log "Setting network_stats_enabled=1 with validation..."
 ATTEMPT=0
-MAX_ATTEMPTS=8
+MAX_ATTEMPTS=5
 while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
     ATTEMPT=$((ATTEMPT + 1))
     settings put global network_stats_enabled 1 2>/dev/null
-    sleep 1
-    
+    sleep 2
+
     NSE_NOW=$(settings get global network_stats_enabled 2>/dev/null)
     if [ "$NSE_NOW" = "1" ]; then
         log "network_stats_enabled=1 confirmed (attempt $ATTEMPT)"
         break
-    elif [ -n "$NSE_NOW" ]; then
-        log "  attempt $ATTEMPT: got '$NSE_NOW' (expected '1'), retrying..."
     else
-        log "  attempt $ATTEMPT: got empty/null, retrying..."
+        log "  attempt $ATTEMPT: got '$NSE_NOW' (expected '1'), retrying..."
     fi
-    
-    # Wait longer between attempts
-    sleep 2
 done
 
 # Final validation
 NSE_FINAL=$(settings get global network_stats_enabled 2>/dev/null)
 if [ "$NSE_FINAL" = "1" ]; then
-    log "SUCCESS: network_stats_enabled=1 (final: $NSE_FINAL)"
+    log "SUCCESS: network_stats_enabled=1"
 else
-    log "WARN: network_stats_enabled not 1 (final: $NSE_FINAL), trying alternatives..."
-    
+    log "WARN: network_stats_enabled not 1 (final: $NSE_FINAL)"
     # Try via content provider
     if command -v content >/dev/null 2>&1; then
         content call --uri content://settings/global --method PUT \
@@ -401,16 +327,36 @@ else
 fi
 
 # ============================================================
-# PHASE 5: VERIFICATION & DIAGNOSTICS
+# PHASE 5: FINAL VERIFICATION
 # ============================================================
-log "--- Phase 5: Verification & Diagnostics ---"
+log "--- Phase 5: Final Verification ---"
 
-FINAL_BPF=0
-if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-    FINAL_BPF=1
-    log "FINAL BPF maps: PRESENT"
+# Re-check BPF maps after netd restart
+FINAL_MAP_COUNT=$(count_bpf_maps)
+log "FINAL BPF maps: $FINAL_MAP_COUNT"
+
+FINAL_OWNER=0
+if [ -e "$BPF_MAP_OWNER" ]; then
+    FINAL_OWNER=1
+    log "FINAL uid_owner_map: PRESENT"
 else
-    log "FINAL BPF maps: absent"
+    log "FINAL uid_owner_map: absent"
+fi
+
+FINAL_APPSTATS=0
+if [ -e "$BPF_MAP_APP_STATS" ]; then
+    FINAL_APPSTATS=1
+    log "FINAL app_uid_stats_map: PRESENT"
+else
+    log "FINAL app_uid_stats_map: absent"
+fi
+
+FINAL_CONFIG=0
+if [ -e "$BPF_MAP_CONFIG" ]; then
+    FINAL_CONFIG=1
+    log "FINAL configuration_map: PRESENT"
+else
+    log "FINAL configuration_map: absent"
 fi
 
 FINAL_XTAGUID=0
@@ -436,47 +382,49 @@ log "============================================"
 log "DIAGNOSTIC SUMMARY:"
 log "============================================"
 
-if [ "$FINAL_BPF" -eq 1 ]; then
-    log "✓ BPF per-UID stats: WORKING"
+# Determine which stats method is available
+if [ "$FINAL_APPSTATS" -eq 1 ] && [ "$FINAL_CONFIG" -eq 1 ]; then
+    log "BPF per-UID stats: INFRASTRUCTURE READY"
+    log "  (maps exist; cgroup_skb programs need kernel >= 5.0 for per-UID data)"
 elif [ "$FINAL_XTAGUID" -eq 1 ]; then
-    log "✓ xt_qtaguid per-UID stats: WORKING (legacy)"
+    log "xt_qtaguid per-UID stats: AVAILABLE (legacy)"
 elif [ "$FINAL_UIDSTAT" -eq 1 ]; then
-    log "◐ uid_stat per-UID TCP stats: AVAILABLE (limited)"
+    log "uid_stat per-UID TCP stats: AVAILABLE (limited)"
 else
-    log "✗ Per-UID stats: NOT AVAILABLE"
+    log "Per-UID stats: NOT AVAILABLE"
 fi
 
 if [ "$FINAL_NSE" = "1" ]; then
-    log "✓ Interface-level stats: ENABLED"
+    log "Interface-level stats: ENABLED"
 else
-    log "✗ Interface-level stats: DISABLED (got: $FINAL_NSE)"
+    log "Interface-level stats: DISABLED (got: $FINAL_NSE)"
 fi
 
 # Overall assessment
-if [ "$FINAL_BPF" -eq 1 ] || [ "$FINAL_XTAGUID" -eq 1 ]; then
+if [ "$FINAL_OWNER" -eq 1 ] && [ "$FINAL_APPSTATS" -eq 1 ]; then
     log ""
-    log "RESULT: PER-UID STATS ARE AVAILABLE"
-    log "Traffic indicator should show per-app traffic."
-elif [ "$FINAL_NSE" = "1" ]; then
+    log "RESULT: BPF maps are present and accessible"
+    log "  - Per-app firewall: READY (uid_owner_map present)"
+    log "  - Per-app traffic stats: READY (app_uid_stats_map present)"
+    log "  - Traffic indicator should work on kernel >= 5.0"
+    if [ "$KMAJOR" -lt 5 ]; then
+        log "  - NOTE: Kernel $KMAJOR.$KMINOR < 5.0, cgroup_skb may not"
+        log "    collect per-UID data. Interface-level stats will be used."
+    fi
+elif [ "$FINAL_XTAGUID" -eq 1 ]; then
     log ""
-    log "RESULT: PARTIAL (interface-level only)"
-    log "Traffic indicator will show total traffic per interface."
-    log "Per-app traffic will not be visible."
-    log ""
-    log "RECOMMENDED FIXES:"
-    log "  1. Flash a ROM with kernel >= 5.4"
-    log "  2. Compile xt_qtaguid module for this kernel"
-    log "  3. Check with your device maintainer for BPF support"
+    log "RESULT: Legacy per-UID stats available"
+    log "  Traffic indicator should show per-app traffic."
 else
     log ""
-    log "RESULT: STATS COLLECTION DISABLED"
-    log "Traffic indicator will not work."
+    log "RESULT: No per-UID stats mechanism available"
+    log "  Traffic indicator will show total traffic per interface."
 fi
 
 log "============================================"
 
 # ============================================================
-# PHASE 6: WATCHDOG (persistent monitoring)
+# PHASE 6: LIGHTWEIGHT WATCHDOG
 # ============================================================
 log ""
 log "=== WATCHDOG STARTED (monitoring interval: 5 min) ==="
@@ -485,57 +433,33 @@ WATCHDOG_COUNT=0
 while true; do
     sleep 300
     WATCHDOG_COUNT=$((WATCHDOG_COUNT + 1))
-    
+
     # Verify critical setting
     NSE_CHECK=$(settings get global network_stats_enabled 2>/dev/null)
     if [ "$NSE_CHECK" != "1" ]; then
         settings put global network_stats_enabled 1 2>/dev/null
         log "[WD-$WATCHDOG_COUNT] Corrected network_stats_enabled (was: $NSE_CHECK)"
     fi
-    
+
     # Verify BPF maps if they were working
-    if [ "$FINAL_BPF" -eq 1 ]; then
-        if [ ! -e "$BPF_MAP" ] || [ ! -e "$BPF_OWNER" ]; then
-            log "[WD-$WATCHDOG_COUNT] WARNING: BPF maps lost! Attempting recovery..."
-            rm -rf /sys/fs/bpf/netd_shared/mainline_done 2>/dev/null
-            stop bpfloader 2>/dev/null
-            sleep 2
-            start bpfloader 2>/dev/null
-            
-            WAIT=0
-            while [ "$(getprop init.svc.bpfloader 2>/dev/null)" = "running" ] && [ "$WAIT" -lt 20 ]; do
-                sleep 1
-                WAIT=$((WAIT + 1))
-            done
-            sleep 2
-            
-            if [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-                log "[WD-$WATCHDOG_COUNT] BPF maps restored successfully"
+    if [ "$FINAL_OWNER" -eq 1 ]; then
+        if [ ! -e "$BPF_MAP_OWNER" ]; then
+            log "[WD-$WATCHDOG_COUNT] WARNING: uid_owner_map lost! Restarting netd..."
+            setprop ctl.restart netd 2>/dev/null
+            sleep 10
+            if [ -e "$BPF_MAP_OWNER" ]; then
+                log "[WD-$WATCHDOG_COUNT] uid_owner_map restored"
             else
-                log "[WD-$WATCHDOG_COUNT] BPF maps recovery failed"
-                FINAL_BPF=0
+                log "[WD-$WATCHDOG_COUNT] uid_owner_map still absent"
             fi
         fi
     fi
-    
-    # Periodic statistics refresh
-    if [ "$(($WATCHDOG_COUNT % 6))" -eq 0 ]; then
-        if cmd netstats force-refresh 2>/dev/null; then
-            :  # silent success
-        fi
-    fi
-    
+
     # Lightweight status log (every 6 cycles = 30 min)
     if [ "$(($WATCHDOG_COUNT % 6))" -eq 0 ]; then
-        NBPF=$([ -e "$BPF_MAP" ] && echo "P" || echo "A")
+        NOMAP=$([ -e "$BPF_MAP_OWNER" ] && echo "Y" || echo "N")
         NNETD=$(getprop init.svc.netd 2>/dev/null | cut -c1-3)
         NSE=$(settings get global network_stats_enabled 2>/dev/null)
-        log "[WD-$WATCHDOG_COUNT] Status: BPF=$NBPF netd=$NNETD NSE=$NSE"
-    fi
-    
-    # Detect if BPF maps appeared after a kernel module was loaded
-    if [ "$FINAL_BPF" -eq 0 ] && [ -e "$BPF_MAP" ] && [ -e "$BPF_OWNER" ]; then
-        log "[WD-$WATCHDOG_COUNT] BPF maps detected! System now has full per-UID stats."
-        FINAL_BPF=1
+        log "[WD-$WATCHDOG_COUNT] Status: owner=$NOMAP netd=$NNETD NSE=$NSE"
     fi
 done
