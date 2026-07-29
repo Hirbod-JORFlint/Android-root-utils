@@ -9,26 +9,21 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # --- Locate JDK ---
 if (-not $JdkHome) {
-    $candidates = @(
-        "${env:JAVA_HOME}",
+    $candidates = @("${env:JAVA_HOME}",
         "C:\Program Files\Java\jdk-24",
         "C:\Program Files\Java\jdk-21",
-        "C:\Program Files\Java\jdk-17"
-    )
+        "C:\Program Files\Java\jdk-17")
     foreach ($c in $candidates) {
         if ($c -and (Test-Path "$c\bin\javac.exe")) { $JdkHome = $c; break }
     }
 }
-if (-not $JdkHome) { throw "JDK 17+ not found. Set `$JdkHome or JAVA_HOME." }
+if (-not $JdkHome) { throw "JDK 17+ not found. Set JAVA_HOME or -JdkHome." }
 Write-Host "JDK: $JdkHome"
 
 # --- Locate / download r8 ---
 if (-not $R8Jar) {
-    $r8Candidates = @(
-        "$Root\r8lib.jar",
-        "$Root\libs\r8lib.jar",
-        "${env:LOCALAPPDATA}\opencode\r8lib.jar"
-    )
+    $r8Candidates = @("$Root\r8lib.jar", "$Root\libs\r8lib.jar",
+        "${env:LOCALAPPDATA}\Flint\r8lib.jar")
     foreach ($c in $r8Candidates) {
         if (Test-Path $c) { $R8Jar = $c; break }
     }
@@ -44,19 +39,17 @@ if (-not (Test-Path $R8Jar)) { throw "r8 JAR not found at $R8Jar" }
 
 $BuildDir = "$Root\build"
 if (Test-Path $BuildDir) { Remove-Item $BuildDir -Recurse -Force }
-New-Item -ItemType Directory -Path $BuildDir | Out-Null
 New-Item -ItemType Directory -Path "$BuildDir\classes" | Out-Null
-
 $Src = "$Root\src"
 $Stubs = "$Root\stubs"
 $Module = "$Root\module"
 
 Write-Host "Compiling..."
-& "$JdkHome\bin\javac" --release 17 -d "$BuildDir\classes" -sourcepath "$Src;$Stubs" "$Src\com\opencode\netstats\NetworkStatsProxy.java" 2>&1
+& "$JdkHome\bin\javac" --release 17 -d "$BuildDir\classes" -sourcepath "$Src;$Stubs" "$Src\com\flint\netstats\NetworkStatsProxy.java" 2>&1
 if (-not $?) { throw "javac failed" }
 
 Write-Host "Converting to DEX..."
-& "$JdkHome\bin\java" -cp $R8Jar com.android.tools.r8.D8 --release --min-api $MinApi --output "$BuildDir\proxy_out.zip" "$BuildDir\classes\com\opencode\netstats\NetworkStatsProxy.class" 2>&1
+& "$JdkHome\bin\java" -cp $R8Jar com.android.tools.r8.D8 --release --min-api $MinApi --output "$BuildDir\proxy_out.zip" "$BuildDir\classes\com\flint\netstats\NetworkStatsProxy.class" 2>&1
 if (-not $?) { throw "d8 failed" }
 
 # Extract classes.dex
