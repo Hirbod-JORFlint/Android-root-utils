@@ -8,11 +8,16 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <errno.h>
+#include <string.h>
 
 #define LOGFILE "/data/local/tmp/netproxy.log"
 static void log_msg(const char* msg) {
     FILE* f = fopen(LOGFILE, "a");
     if (f) { fprintf(f, "netproxy: %s\n", msg); fclose(f); }
+}
+static void log_errno(const char* ctx) {
+    FILE* f = fopen(LOGFILE, "a");
+    if (f) { fprintf(f, "netproxy: %s failed: errno=%d (%s)\n", ctx, errno, strerror(errno)); fclose(f); }
 }
 
 /* ---- Binder driver structures (from linux/binder.h) ---- */
@@ -59,12 +64,12 @@ struct binder_write_read {
     void*   read_buffer;
 };
 
-/* Binder command codes (write to driver) */
+/* Binder command codes (write to driver) — must match kernel binder.h exactly */
 #define BC_TRANSACTION        _IOC(_IOC_WRITE, 'c', 0, sizeof(struct binder_transaction_data))
 #define BC_REPLY              _IOC(_IOC_WRITE, 'c', 1, sizeof(struct binder_transaction_data))
-#define BC_ENTER_LOOPER       _IOC(_IOC_WRITE, 'c', 3, 0)
-#define BC_EXIT_LOOPER        _IOC(_IOC_WRITE, 'c', 4, 0)
-#define BC_REGISTER_LOOPER    _IOC(_IOC_WRITE, 'c', 2, 0)
+#define BC_ENTER_LOOPER       _IOC(_IOC_NONE,  'c', 3, 0)
+#define BC_EXIT_LOOPER        _IOC(_IOC_NONE,  'c', 4, 0)
+#define BC_REGISTER_LOOPER    _IOC(_IOC_NONE,  'c', 2, 0)
 #define BC_FREE_BUFFER        _IOC(_IOC_WRITE, 'c', 5, sizeof(void*))
 
 /* Binder response codes (read from driver) */
@@ -227,13 +232,13 @@ static size_t binder_map_size = 1024 * 1024;  // 1 MB
 static int open_binder() {
     binder_fd = open("/dev/binder", O_RDWR);
     if (binder_fd < 0) {
-        log_msg("open /dev/binder failed");
+        log_errno("open /dev/binder");
         return -1;
     }
     
     struct binder_version ver;
     if (ioctl(binder_fd, BINDER_VERSION, &ver) < 0) {
-        log_msg("BINDER_VERSION ioctl failed");
+        log_errno("BINDER_VERSION");
         close(binder_fd); binder_fd = -1;
         return -1;
     }
@@ -242,17 +247,18 @@ static int open_binder() {
     }
     
     size_t max_threads = 4;
-    ioctl(binder_fd, BINDER_SET_MAX_THREADS, &max_threads);
+    if (ioctl(binder_fd, BINDER_SET_MAX_THREADS, &max_threads) < 0)
+        log_errno("BINDER_SET_MAX_THREADS");
     
     binder_map = (uint8_t*)mmap(NULL, binder_map_size, PROT_READ,
                                 MAP_PRIVATE | MAP_NORESERVE | MAP_POPULATE,
                                 binder_fd, 0);
     if (binder_map == MAP_FAILED) {
-        log_msg("mmap binder failed, trying without POPULATE");
+        log_errno("mmap (POPULATE)");
         binder_map = (uint8_t*)mmap(NULL, binder_map_size, PROT_READ,
                                     MAP_PRIVATE, binder_fd, 0);
         if (binder_map == MAP_FAILED) {
-            log_msg("mmap binder failed");
+            log_errno("mmap (plain)");
             close(binder_fd); binder_fd = -1;
             return -1;
         }
@@ -262,7 +268,6 @@ static int open_binder() {
 }
 
 static int send_binder_cmd(int cmd, const void* data, size_t data_size) {
-    // Build command buffer: [cmd32, data...]
     size_t total = 4 + data_size;
     uint8_t* wbuf = (uint8_t*)malloc(total);
     if (!wbuf) return -1;
@@ -273,8 +278,10 @@ static int send_binder_cmd(int cmd, const void* data, size_t data_size) {
     memset(&bwr, 0, sizeof(bwr));
     bwr.write_buffer = wbuf;
     bwr.write_size = total;
+    // Leave read_buffer NULL / read_size 0 — pure write
     
     int ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
+    if (ret < 0) log_errno("send_binder_cmd");
     free(wbuf);
     return ret;
 }
@@ -416,7 +423,7 @@ static int send_reply(const struct binder_transaction_data* req,
     
     int ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
     if (ret < 0) {
-        log_msg("send_reply ioctl failed");
+        log_errno("send_reply");
         return -1;
     }
     return 0;
@@ -431,122 +438,31 @@ static int register_with_sm() {
     // String16 service name
     write_string16_aligned(&p, "netstats");
     
-    // flat_binder_object representing our local service
-    // type = BINDER_TYPE_BINDER (local)
-    // binder = our AIBinder pointer (we use a static value)
-    // cookie = 0
-    align_to_4(&p);
+    // flat_binder_object — save its offset for the kernel's offsets array
+    uint32_t fbo_offset = (uint32_t)(p - pbuf);
     struct flat_binder_object fbo;
     memset(&fbo, 0, sizeof(fbo));
     fbo.type = BINDER_TYPE_BINDER;
     fbo.binder = local_binder;
     fbo.cookie = 0;
-    fbo.flags = 0;  // 0x127 = private, 0 = normal
+    fbo.flags = 0;
     memcpy(p, &fbo, sizeof(fbo)); p += sizeof(fbo);
     
     // allow_isolated = 0
     write_uint32(&p, 0);
     
     size_t psize = p - pbuf;
+    size_t offs_size = sizeof(uint32_t);
     
     log_msg("registering with ServiceManager...");
     
-    // craft a transaction with offsets for the flat_binder_object
-    // We need to tell the driver where the flat_binder_object is
-    // For simplicity, we put a fake offset at 0
-    // Actually, for binder objects we MUST provide offsets
-    uint8_t tbuf[1024];
-    uint8_t* tp = tbuf;
-    
-    // The transaction data format: Parcel data + offsets array
-    // But the driver expects binder_transaction_data with offsets
-    
-    // Actually, let me restructure: we send a BC_TRANSACTION with proper offset info
-    // The offsets array points to each flat_binder_object in the data
-    
-    // We need offsets_size > 0 because we have a flat_binder_object
-    // Each offset is the byte offset from start of data buffer to the flat_binder_object
-    
-    // Wait, the offset of fbo from the start of the data buffer:
-    // String16 = 4 (length) + (len("netstats")+1)*2 bytes
-    // then padding to 4 bytes
-    // then fbo starts at `pbuf + 4 + (7+1)*2 = pbuf + 20`, aligned to 4
-    // Actually: write_string16_aligned does:
-    //   write_uint32(len+1) = 4 bytes
-    //   write 8 char16_t values = 16 bytes
-    //   total = 20 bytes, already aligned
-    //   fbo starts at offset 20 from pbuf
-    uint32_t fbo_offset = 20;
-    
-    // But wait, the driver expects the data to be in a specific format for
-    // registering services. Let me look at the ServiceManager source.
-    
-    // Actually, for ADD_SERVICE, the ServiceManager expects:
-    // Parcel containing:
-    //   strong_ptr_t: Binder (which is a flat_binder_object)
-    //   int32_t: allow_isolated
-    // The name is passed as String16
-    
-    // But the parcel is actually encoded by the framework's Parcel class.
-    // The flat_binder_object is embedded at a specific offset within the Parcel data.
-    
-    // Let me just try to build the complete transaction with offsets
-    uint8_t* tx_data = tbuf + sizeof(struct binder_transaction_data);
-    uint32_t* offsets_arr = (uint32_t*)(tx_data + psize);
-    size_t offs_size = sizeof(uint32_t); // one offset
-    
-    memcpy(tx_data, pbuf, psize);
-    offsets_arr[0] = fbo_offset;
-    
-    struct binder_transaction_data tr;
-    memset(&tr, 0, sizeof(tr));
-    tr.target.handle = 0;  // ServiceManager
-    tr.code = ADD_SERVICE_TRANS;
-    tr.data.ptr.buffer = tx_data;
-    tr.data.ptr.offsets = offsets_arr;
-    tr.data_size = psize;
-    tr.offsets_size = offs_size;
-    
-    uint8_t wbuf[2048];
-    uint8_t* wp = wbuf;
-    *(uint32_t*)wp = BC_TRANSACTION; wp += 4;
-    memcpy(wp, &tr, sizeof(tr)); wp += sizeof(tr);
-    size_t wsize = wp - wbuf;
-    // Add the actual data after the command struct
-    memcpy(wp, tx_data, psize); wp += psize;
-    // Actually the data is referenced by pointer in the struct, but the ioctl
-    // expects everything in the write buffer. The driver reads the buffer pointer
-    // from the struct and expects it to be valid. Since we're not relocating,
-    // the buffer pointer should point to the data within the same memory.
-    // Let me fix this: the data buffer pointer should point to the actual data.
-    // But our struct has data.ptr.buffer = tx_data which is in stack.
-    // The ioctl copies the write buffer to kernel space. The kernel then reads
-    // the data.ptr.buffer pointer. Since we passed the buffer via write_buffer,
-    // the pointer tx_data is a user-space address that the kernel will copy_from_user.
-    // This should work.
-    
-    // Actually, the way BINDER_WRITE_READ works:
-    // 1. Kernel copies write_buffer from userspace
-    // 2. Kernel processes the commands in the buffer
-    // 3. For BC_TRANSACTION, the binder_transaction_data contains pointers to data
-    //    These pointers are user-space addresses that the kernel copies from
-    
-    // So the data.ptr.buffer and data.ptr.offsets must point to memory within
-    // the userspace process that is accessible. Since we allocated them on the
-    // stack, they should be accessible. But the kernel copies FROM them during
-    // the ioctl call, so they need to be valid at the time of the call.
-    
-    // Let me rewrite more carefully:
+    // Layout: cmd(4) + binder_transaction_data + [parcel_data + offsets]
     uint8_t* bigbuf = (uint8_t*)malloc(4096);
     if (!bigbuf) return -1;
-    
-    // Layout: cmd + binder_transaction_data + [data_buffer + offsets]
     uint8_t* bb = bigbuf;
     
-    // Command
     *(uint32_t*)bb = BC_TRANSACTION; bb += 4;
     
-    // Transaction header (with pointers to data AFTER the header)
     struct binder_transaction_data* trp = (struct binder_transaction_data*)bb;
     memset(trp, 0, sizeof(*trp)); bb += sizeof(*trp);
     
@@ -554,12 +470,12 @@ static int register_with_sm() {
     trp->code = ADD_SERVICE_TRANS;
     trp->data_size = psize;
     trp->offsets_size = offs_size;
-    trp->data.ptr.buffer = bb;       // point to data right here
+    trp->data.ptr.buffer = bb;
     trp->data.ptr.offsets = (void*)((uintptr_t)bb + psize);
     
-    // Copy data
-    memcpy(bb, pbuf, psize); bb += psize;
-    memcpy(bb, offsets_arr, offs_size); bb += offs_size;
+    memcpy(bb, pbuf, psize);
+    *(uint32_t*)(bb + psize) = fbo_offset;
+    bb += psize + offs_size;
     
     size_t total_size = bb - bigbuf;
     
@@ -572,7 +488,7 @@ static int register_with_sm() {
     
     ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
     if (ret < 0) {
-        log_msg("ADD_SERVICE ioctl failed");
+        log_errno("ADD_SERVICE");
         free(bigbuf); free(bwr.read_buffer);
         return -1;
     }
@@ -592,7 +508,6 @@ static int register_with_sm() {
                 const struct binder_transaction_data* rtr =
                     (const struct binder_transaction_data*)rp;
                 rp += sizeof(*rtr);
-                // Free buffer
                 uint8_t fcmd[4 + 8];
                 *(uint32_t*)fcmd = BC_FREE_BUFFER;
                 memcpy(fcmd + 4, &rtr->data.ptr.buffer, 8);
@@ -744,9 +659,11 @@ int main(void) {
         
         int ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
         if (ret < 0) {
-            log_msg("main loop ioctl failed");
+            log_errno("main loop ioctl");
+            if (errno == EINTR) continue;
             break;
         }
+        if (bwr.read_consumed == 0) continue;
         
         const uint8_t* rp = rbuf;
         const uint8_t* rend = rbuf + bwr.read_consumed;
