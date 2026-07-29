@@ -1,7 +1,6 @@
 #!/system/bin/sh
 MODDIR=${0%/*}
 LOG=/data/local/tmp/netproxy.log
-PROXY_BIN="$MODDIR/system/bin/netproxy"
 
 log() { echo "$(date) [service-lite] $*" >> "$LOG"; }
 
@@ -16,7 +15,6 @@ sleep 15
 chmod 0644 /proc/net/dev 2>/dev/null
 chmod 0644 /proc/self/net/dev 2>/dev/null
 
-# Apply comprehensive SELinux policies via magiskpolicy
 magiskpolicy --live "allow * proc_net:file { read open getattr }" 2>/dev/null
 magiskpolicy --live "allow * proc_net:dir { read search open }" 2>/dev/null
 magiskpolicy --live "allow * binder_device:chr_file { read write open ioctl }" 2>/dev/null
@@ -26,41 +24,104 @@ magiskpolicy --live "allow system_server proc_net:file { read open getattr }" 2>
 magiskpolicy --live "allow system_server proc_net:dir { read search open }" 2>/dev/null
 log "SELinux policies applied"
 
-# Try to find the right arch binary
-if [ -f "$PROXY_BIN" ]; then
-    TARGET_BIN="$PROXY_BIN"
-else
-    ARCH=$(getprop ro.product.cpu.abi 2>/dev/null)
-    case "$ARCH" in
+# Multi-path binary resolution
+find_netproxy() {
+    local probe
+    for probe in \
+        "$MODDIR/system/bin/netproxy" \
+        "${0%/*}/system/bin/netproxy" \
+        "/data/adb/modules/netstats-fix/system/bin/netproxy" \
+        "/data/adb/modules/netstats-fix-lite/system/bin/netproxy" \
+        "/system/bin/netproxy" \
+        "/apex/com.android.conscrypt/bin/netproxy" \
+        "$(dirname "$0" 2>/dev/null)/system/bin/netproxy"; do
+        [ -f "$probe" ] && { echo "$probe"; return 0; }
+    done
+
+    log "Searching for netproxy in module directory..."
+    local found
+    found=$(find "$MODDIR" -name "netproxy" -type f 2>/dev/null | head -1)
+    [ -n "$found" ] && { echo "$found"; return 0; }
+
+    found=$(find /data/adb/modules -name "netproxy" -type f 2>/dev/null | head -1)
+    [ -n "$found" ] && { echo "$found"; return 0; }
+
+    return 1
+}
+
+# Architecture-aware binary selection
+select_arch_binary() {
+    local base_bin="$1"
+    local dir; dir=$(dirname "$base_bin")
+    local arch; arch=$(getprop ro.product.cpu.abi 2>/dev/null)
+    log "Detected arch: ${arch:-unknown}"
+    case "$arch" in
         arm64-v8a|arm64)
-            TARGET_BIN="$PROXY_BIN"
-            [ ! -f "$TARGET_BIN" ] && TARGET_BIN="$MODDIR/system/bin/netproxy"
+            [ -f "$base_bin" ] && { echo "$base_bin"; return 0; }
+            [ -f "$dir/netproxy_arm" ] && { echo "$dir/netproxy_arm"; return 0; }
+            [ -f "$dir/../netproxy" ] && { echo "$dir/../netproxy"; return 0; }
+            [ -f "$dir/../netproxy_arm" ] && { echo "$dir/../netproxy_arm"; return 0; }
             ;;
         armeabi-v7a|armeabi)
-            TARGET_BIN="$MODDIR/system/bin/netproxy_arm"
-            [ ! -f "$TARGET_BIN" ] && TARGET_BIN="$PROXY_BIN"
+            [ -f "$dir/netproxy_arm" ] && { echo "$dir/netproxy_arm"; return 0; }
+            [ -f "$base_bin" ] && { echo "$base_bin"; return 0; }
             ;;
         *)
-            TARGET_BIN="$PROXY_BIN"
+            [ -f "$base_bin" ] && { echo "$base_bin"; return 0; }
+            [ -f "$dir/netproxy_arm" ] && { echo "$dir/netproxy_arm"; return 0; }
             ;;
     esac
+    return 1
+}
+
+PROXY_BIN=$(find_netproxy)
+if [ -z "$PROXY_BIN" ]; then
+    log "FATAL: netproxy not found after exhaustive search"
+    log "MODDIR=$MODDIR"
+    log "Contents of $MODDIR:"
+    ls -la "$MODDIR" 2>/dev/null >> "$LOG" || log "  (cannot list)"
+    log "Contents of ${MODDIR}/system:"
+    ls -la "$MODDIR/system" 2>/dev/null >> "$LOG" || log "  (cannot list)"
+    log "Contents of ${MODDIR}/system/bin:"
+    ls -la "$MODDIR/system/bin" 2>/dev/null >> "$LOG" || log "  (cannot list)"
+    log "Searching /data/adb/modules:"
+    ls -la /data/adb/modules/ 2>/dev/null >> "$LOG" || log "  (no modules dir)"
+    exit 1
 fi
 
-if [ -f "$TARGET_BIN" ]; then
-    chmod 755 "$TARGET_BIN"
-    log "Starting netproxy: $TARGET_BIN"
+TARGET_BIN=$(select_arch_binary "$PROXY_BIN")
+if [ -z "$TARGET_BIN" ]; then
+    TARGET_BIN="$PROXY_BIN"
+fi
+
+log "Found binary: $TARGET_BIN"
+chmod 755 "$TARGET_BIN"
+
+# Verify binary is executable ELF
+if ! head -c 4 "$TARGET_BIN" 2>/dev/null | grep -q $'\x7fELF'; then
+    log "WARNING: $TARGET_BIN is not an ELF binary!"
+fi
+
+log "Starting netproxy..."
+nohup "$TARGET_BIN" >> "$LOG" 2>&1 &
+PROXY_PID=$!
+log "Proxy launched (pid=$PROXY_PID)"
+sleep 3
+if kill -0 "$PROXY_PID" 2>/dev/null; then
+    log "Proxy is running (PID $PROXY_PID)"
+else
+    log "Proxy exited prematurely (exit code: $?)"
+    # Retry once
+    log "Retrying netproxy..."
     nohup "$TARGET_BIN" >> "$LOG" 2>&1 &
     PROXY_PID=$!
-    log "Proxy launched (pid=$PROXY_PID)"
-    sleep 2
+    log "Proxy retry launched (pid=$PROXY_PID)"
+    sleep 3
     if kill -0 "$PROXY_PID" 2>/dev/null; then
-        log "Proxy is running"
+        log "Proxy running after retry"
     else
-        log "Proxy exited prematurely"
+        log "Proxy failed again"
     fi
-else
-    log "FATAL: netproxy not found"
-    exit 1
 fi
 
 settings put global network_stats_enabled 1 2>/dev/null

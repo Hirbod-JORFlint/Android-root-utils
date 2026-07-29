@@ -1,13 +1,9 @@
 #!/system/bin/sh
 MODDIR=${0%/*}
 LOG=/data/local/tmp/netproxy.log
-PROXY_BIN="$MODDIR/system/bin/netproxy"
 
 log() { echo "$(date) [service] $*" >> "$LOG"; }
 
-# ============================================================
-# BPF map paths
-# ============================================================
 BPF_DIR="/sys/fs/bpf/netd_shared"
 BPF_MAP_OWNER="$BPF_DIR/map_netd_uid_owner_map"
 BPF_MAP_APP_STATS="$BPF_DIR/map_netd_app_uid_stats_map"
@@ -15,12 +11,6 @@ BPF_MAP_COOKIE="$BPF_DIR/map_netd_cookie_tag_map"
 BPF_MAP_CONFIG="$BPF_DIR/map_netd_configuration_map"
 BPF_MAP_STATS_A="$BPF_DIR/map_netd_stats_map_A"
 BPF_MAP_STATS_B="$BPF_DIR/map_netd_stats_map_B"
-BPF_MAP_UID_PERM="$BPF_DIR/map_netd_uid_permission_map"
-BPF_MAP_IFACE_STATS="$BPF_DIR/map_netd_iface_stats_map"
-
-# Alternate BPF mount paths (some ROMs use different mountpoints)
-BPF_DIR_ALT1="/sys/fs/bpf/netd_shared"
-BPF_DIR_ALT2="/sys/fs/bpf"
 
 count_bpf_maps() {
     local c=0
@@ -35,22 +25,94 @@ bpf_stats_ready() {
     [ -e "$BPF_MAP_APP_STATS" ] && [ -e "$BPF_MAP_CONFIG" ]
 }
 
-# ============================================================
-# PHASE 0: Wait for boot
-# ============================================================
+# Multi-path binary resolution (shared with lite)
+find_netproxy() {
+    local probe
+    for probe in \
+        "$MODDIR/system/bin/netproxy" \
+        "${0%/*}/system/bin/netproxy" \
+        "/data/adb/modules/netstats-fix/system/bin/netproxy" \
+        "/data/adb/modules/netstats-fix-lite/system/bin/netproxy" \
+        "/system/bin/netproxy" \
+        "$(dirname "$0" 2>/dev/null)/system/bin/netproxy"; do
+        [ -f "$probe" ] && { echo "$probe"; return 0; }
+    done
+    local found
+    found=$(find "$MODDIR" -name "netproxy" -type f 2>/dev/null | head -1)
+    [ -n "$found" ] && { echo "$found"; return 0; }
+    found=$(find /data/adb/modules -name "netproxy" -type f 2>/dev/null | head -1)
+    [ -n "$found" ] && { echo "$found"; return 0; }
+    return 1
+}
+
+select_arch_binary() {
+    local base_bin="$1"
+    local dir; dir=$(dirname "$base_bin")
+    local arch; arch=$(getprop ro.product.cpu.abi 2>/dev/null)
+    log "Detected arch: ${arch:-unknown}"
+    case "$arch" in
+        arm64-v8a|arm64)
+            [ -f "$base_bin" ] && { echo "$base_bin"; return 0; }
+            [ -f "$dir/netproxy_arm" ] && { echo "$dir/netproxy_arm"; return 0; }
+            [ -f "$dir/../netproxy" ] && { echo "$dir/../netproxy"; return 0; }
+            [ -f "$dir/../netproxy_arm" ] && { echo "$dir/../netproxy_arm"; return 0; }
+            ;;
+        armeabi-v7a|armeabi)
+            [ -f "$dir/netproxy_arm" ] && { echo "$dir/netproxy_arm"; return 0; }
+            [ -f "$base_bin" ] && { echo "$base_bin"; return 0; }
+            ;;
+        *)
+            [ -f "$base_bin" ] && { echo "$base_bin"; return 0; }
+            [ -f "$dir/netproxy_arm" ] && { echo "$dir/netproxy_arm"; return 0; }
+            ;;
+    esac
+    return 1
+}
+
+start_proxy() {
+    local bin="$1"
+    if [ ! -f "$bin" ]; then
+        log "start_proxy: binary not found at $bin"
+        return 1
+    fi
+    chmod 755 "$bin"
+    if ! head -c 4 "$bin" 2>/dev/null | grep -q $'\x7fELF'; then
+        log "WARNING: $bin is not an ELF binary!"
+    fi
+    log "Starting netproxy: $bin"
+    nohup "$bin" >> "$LOG" 2>&1 &
+    local pid=$!
+    log "Proxy launched (pid=$pid)"
+    sleep 3
+    if kill -0 "$pid" 2>/dev/null; then
+        log "Proxy is running (PID $pid)"
+        echo "$pid"
+        return 0
+    else
+        log "Proxy exited prematurely, retrying..."
+        nohup "$bin" >> "$LOG" 2>&1 &
+        pid=$!
+        log "Proxy retry launched (pid=$pid)"
+        sleep 3
+        if kill -0 "$pid" 2>/dev/null; then
+            log "Proxy running after retry"
+            echo "$pid"
+            return 0
+        fi
+        log "Proxy failed both attempts"
+        return 1
+    fi
+}
+
 log "=== service.sh started ==="
 WAIT=0
 while [ "$(getprop sys.boot_completed)" != "1" ] && [ "$WAIT" -lt 180 ]; do
     sleep 1; WAIT=$((WAIT + 1))
 done
 log "Boot completed after ${WAIT}s"
-
-# Wait a bit more for services to settle
 sleep 20
 
-# ============================================================
-# PHASE 1: Diagnostics
-# ============================================================
+# ==================== PHASE 1: Diagnostics ====================
 log "--- Phase 1: Diagnostics ---"
 
 KVER=$(uname -r 2>/dev/null)
@@ -65,9 +127,7 @@ log "Android: $(getprop ro.build.version.sdk 2>/dev/null)"
 log "SELinux: $(getenforce 2>/dev/null)"
 
 BPF_CAPABLE=0
-if [ "$KMAJOR" -gt 4 ] || { [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -ge 9 ]; }; then
-    BPF_CAPABLE=1
-fi
+[ "$KMAJOR" -gt 4 ] || { [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -ge 9 ]; } && BPF_CAPABLE=1
 log "BPF capable kernel: $BPF_CAPABLE"
 
 MAP_COUNT=$(count_bpf_maps)
@@ -87,9 +147,7 @@ log "bpfloader: $(getprop init.svc.bpfloader 2>/dev/null)"
 log "network_stats_enabled: $(settings get global network_stats_enabled 2>/dev/null)"
 log "restricted_networking_mode: $(settings get global restricted_networking_mode 2>/dev/null)"
 
-# ============================================================
-# PHASE 2: SELinux Audit (collect denials without breaking)
-# ============================================================
+# ==================== PHASE 2: SELinux Audit ====================
 log "--- SELinux Denial Diagnostics ---"
 dmesg 2>/dev/null | grep -i 'avc.*denied' | grep -iE 'bpf|netd|net_bw|bpfloader|proc_net|qtaguid' | tail -20 | while read line; do
     log "  DENIED: $line"
@@ -98,9 +156,7 @@ logcat -d -b all -e 'avc.*denied' 2>/dev/null | grep -iE 'bpf|netd|net_bw|bpfloa
     log "  LOGCAT: $line"
 done
 
-# ============================================================
-# PHASE 3: BPF Repair (only if maps are missing and kernel >= 4.9)
-# ============================================================
+# ==================== PHASE 3: BPF Repair ====================
 BPF_STATS_OK=0
 if bpf_stats_ready; then
     BPF_STATS_OK=1
@@ -110,7 +166,6 @@ elif [ "$BPF_CAPABLE" -eq 0 ]; then
 else
     log "--- Phase 3: BPF Repair ---"
 
-    # Step 1: Verify kver_override
     CORRECT_KVER="${KMAJOR}.${KMINOR}.${KPATCH}"
     CURRENT_OVERRIDE=$(getprop ro.bpf.kver_override 2>/dev/null)
     if [ "$CURRENT_OVERRIDE" != "$CORRECT_KVER" ]; then
@@ -121,15 +176,12 @@ else
         log "Step 1: kver_override already correct ($CORRECT_KVER)"
     fi
 
-    # Step 2: Delete stale mainline_done
     [ -d "$BPF_DIR/mainline_done" ] && rm -rf "$BPF_DIR/mainline_done" 2>/dev/null && \
         log "Step 2: Deleted stale mainline_done"
 
-    # Step 3: Enable BPF JIT
     echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null && \
         log "Step 3: BPF JIT enabled"
 
-    # Step 4: Try to reload bpfloader (up to 2 attempts)
     BPF_ATTEMPT=0
     while [ "$BPF_ATTEMPT" -lt 2 ] && [ "$(count_bpf_maps)" -lt 6 ]; do
         BPF_ATTEMPT=$((BPF_ATTEMPT + 1))
@@ -159,9 +211,7 @@ else
     fi
 fi
 
-# ============================================================
-# PHASE 4: Netd Restart (if BPF now working)
-# ============================================================
+# ==================== PHASE 4: Netd Restart ====================
 if [ "$BPF_STATS_OK" -eq 1 ]; then
     log "--- Phase 4: Restarting netd ---"
     setprop ctl.restart netd 2>/dev/null
@@ -173,9 +223,7 @@ if [ "$BPF_STATS_OK" -eq 1 ]; then
     log "Netd restarted (waited ${NETD_WAIT}s)"
 fi
 
-# ============================================================
-# PHASE 5: Settings
-# ============================================================
+# ==================== PHASE 5: Settings ====================
 log "--- Phase 5: Settings ---"
 
 settings put global restricted_networking_mode 0 2>/dev/null
@@ -192,23 +240,20 @@ while [ "$ATTEMPT" -lt 10 ]; do
     log "  attempt $ATTEMPT: got '$NSE'"
 done
 
-# Also set netstats_enabled (AOSP compat)
 settings put global netstats_enabled 1 2>/dev/null
-
 cmd netstats force-refresh 2>/dev/null && log "force-refresh: success" || log "force-refresh: not available"
 cmd netstatscore force-refresh 2>/dev/null && log "force-refresh(core): success" || true
 
-# ============================================================
-# PHASE 6: Native Proxy Fallback
-# ============================================================
+# ==================== PHASE 6: Native Proxy Fallback ====================
 PROXY_RUNNING=0
+TARGET_BIN=""
+
 if [ "$BPF_STATS_OK" -eq 0 ]; then
     log "--- Phase 6: Native Proxy Fallback ---"
 
     chmod 0644 /proc/net/dev 2>/dev/null
     chmod 0644 /proc/self/net/dev 2>/dev/null
 
-    # Apply comprehensive SELinux policies via magiskpolicy
     magiskpolicy --live "allow * proc_net:file { read open getattr }" 2>/dev/null
     magiskpolicy --live "allow * proc_net:dir { read search open }" 2>/dev/null
     magiskpolicy --live "allow * binder_device:chr_file { read write open ioctl }" 2>/dev/null
@@ -218,51 +263,33 @@ if [ "$BPF_STATS_OK" -eq 0 ]; then
     magiskpolicy --live "allow system_server proc_net:file { read open getattr }" 2>/dev/null
     magiskpolicy --live "allow system_server proc_net:dir { read search open }" 2>/dev/null
 
-    # Try to find the right arch binary
-    if [ -f "$PROXY_BIN" ]; then
-        TARGET_BIN="$PROXY_BIN"
+    PROXY_BIN=$(find_netproxy)
+    if [ -z "$PROXY_BIN" ]; then
+        log "FATAL: netproxy not found after exhaustive search"
+        log "MODDIR=$MODDIR"
+        log "Contents of $MODDIR:"
+        ls -la "$MODDIR" 2>/dev/null >> "$LOG" || log "  (cannot list)"
+        log "Contents of ${MODDIR}/system:"
+        ls -la "$MODDIR/system" 2>/dev/null >> "$LOG" || log "  (cannot list)"
+        log "Contents of ${MODDIR}/system/bin:"
+        ls -la "$MODDIR/system/bin" 2>/dev/null >> "$LOG" || log "  (cannot list)"
+        log "Searching /data/adb/modules:"
+        ls -la /data/adb/modules/ 2>/dev/null >> "$LOG" || log "  (no modules dir)"
     else
-        # Try alternate architectures
-        ARCH=$(getprop ro.product.cpu.abi 2>/dev/null)
-        case "$ARCH" in
-            arm64-v8a|arm64)
-                TARGET_BIN="$PROXY_BIN"
-                [ ! -f "$TARGET_BIN" ] && TARGET_BIN="$MODDIR/system/bin/netproxy"
-                ;;
-            armeabi-v7a|armeabi)
-                TARGET_BIN="$MODDIR/system/bin/netproxy_arm"
-                [ ! -f "$TARGET_BIN" ] && TARGET_BIN="$PROXY_BIN"
-                ;;
-            *)
-                TARGET_BIN="$PROXY_BIN"
-                ;;
-        esac
-    fi
+        TARGET_BIN=$(select_arch_binary "$PROXY_BIN")
+        [ -z "$TARGET_BIN" ] && TARGET_BIN="$PROXY_BIN"
 
-    if [ -f "$TARGET_BIN" ]; then
-        chmod 755 "$TARGET_BIN"
-        log "Starting netproxy: $TARGET_BIN"
-        nohup "$TARGET_BIN" >> "$LOG" 2>&1 &
-        PROXY_PID=$!
-        log "Proxy launched (pid=$PROXY_PID)"
-        PROXY_RUNNING=1
-        sleep 2
-        if kill -0 "$PROXY_PID" 2>/dev/null; then
-            log "Proxy is running"
-        else
-            log "Proxy exited prematurely"
-            PROXY_RUNNING=0
+        log "Found binary: $TARGET_BIN"
+        PROXY_PID=$(start_proxy "$TARGET_BIN")
+        if [ -n "$PROXY_PID" ] && [ "$PROXY_PID" -gt 0 ] 2>/dev/null; then
+            PROXY_RUNNING=1
         fi
-    else
-        log "FATAL: netproxy not found at $TARGET_BIN"
     fi
 else
     log "--- Phase 6: BPF working, skipping proxy ---"
 fi
 
-# ============================================================
-# PHASE 7: Restart SystemUI
-# ============================================================
+# ==================== PHASE 7: Restart SystemUI ====================
 log "--- Phase 7: Restart SystemUI ---"
 sleep 3
 killall -9 com.android.systemui 2>/dev/null || \
@@ -273,9 +300,7 @@ sleep 8
 SYSUI_PID=$(pidof com.android.systemui 2>/dev/null)
 log "SystemUI running as pid=$SYSUI_PID"
 
-# ============================================================
-# PHASE 8: Summary
-# ============================================================
+# ==================== PHASE 8: Summary ====================
 log "============================================"
 if [ "$BPF_STATS_OK" -eq 1 ]; then
     log "RESULT: BPF maps fixed - native stats active"
@@ -289,44 +314,36 @@ fi
 log "============================================"
 log "=== service.sh complete ==="
 
-# ============================================================
-# PHASE 9: Watchdog
-# ============================================================
+# ==================== PHASE 9: Watchdog ====================
 WD_COUNT=0
 while true; do
     sleep 300
     WD_COUNT=$((WD_COUNT + 1))
 
-    # Ensure network_stats_enabled stays 1
     NSE=$(settings get global network_stats_enabled 2>/dev/null)
     [ "$NSE" != "1" ] && settings put global network_stats_enabled 1 2>/dev/null && \
         log "[WD-$WD_COUNT] Corrected NSE (was: $NSE)"
 
-    # Check if netd is running
     NETD_STATUS=$(getprop init.svc.netd 2>/dev/null)
     if [ "$NETD_STATUS" != "running" ]; then
         log "[WD-$WD_COUNT] netd not running ($NETD_STATUS), restarting..."
         setprop ctl.restart netd 2>/dev/null
     fi
 
-    # If BPF stats were OK but maps are gone, restart netd
     if [ "$BPF_STATS_OK" -eq 1 ] && [ ! -e "$BPF_MAP_APP_STATS" ]; then
         log "[WD-$WD_COUNT] BPF maps lost, restarting netd..."
         setprop ctl.restart netd 2>/dev/null
         sleep 10
     fi
 
-    # If proxy was running but died, restart it
-    if [ "$PROXY_RUNNING" -eq 1 ] && [ -f "$TARGET_BIN" ]; then
-        PROXY_PID=$(pidof netproxy 2>/dev/null || pidof "$TARGET_BIN" 2>/dev/null)
-        if [ -z "$PROXY_PID" ] || [ "$PROXY_PID" = "0" ]; then
+    if [ "$PROXY_RUNNING" -eq 1 ] && [ -n "$TARGET_BIN" ] && [ -f "$TARGET_BIN" ]; then
+        PROXY_PID_CHECK=$(pidof netproxy 2>/dev/null)
+        if [ -z "$PROXY_PID_CHECK" ] || [ "$PROXY_PID_CHECK" = "0" ]; then
             log "[WD-$WD_COUNT] Proxy died, restarting..."
-            nohup "$TARGET_BIN" >> "$LOG" 2>&1 &
-            log "[WD-$WD_COUNT] Proxy restarted (pid=$!)"
+            start_proxy "$TARGET_BIN" > /dev/null && PROXY_RUNNING=1 || PROXY_RUNNING=0
         fi
     fi
 
-    # Periodic status report
     if [ "$(($WD_COUNT % 6))" -eq 0 ]; then
         M=$( [ -e "$BPF_MAP_OWNER" ] && echo Y || echo N )
         P=$( [ "$PROXY_RUNNING" -eq 1 ] && echo Y || echo N )

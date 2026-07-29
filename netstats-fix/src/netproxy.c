@@ -254,6 +254,9 @@ static int register_with_sm() {
     uint8_t pbuf[1024];
     uint8_t* p = pbuf;
 
+    write_uint32(&p, 0);
+    write_string16(&p, "android.os.IServiceManager");
+
     write_string16(&p, "netstats");
 
     uint32_t fbo_offset = (uint32_t)(uintptr_t)(p - pbuf);
@@ -380,8 +383,7 @@ static void handle_getIfaceStats(const struct binder_transaction_data* tr,
     const uint8_t* pp = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
     const uint8_t* pend = pp + tr->data_size;
 
-    pp += 8;
-
+    pp += 4;
     if (pp + 4 <= pend) skip_string16(&pp);
 
     char iface[64] = "wlan0";
@@ -424,8 +426,7 @@ static void handle_getTotalStats(const struct binder_transaction_data* tr,
     const uint8_t* pp = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
     const uint8_t* pend = pp + tr->data_size;
 
-    pp += 8;
-
+    pp += 4;
     if (pp + 4 <= pend) skip_string16(&pp);
 
     int type = TYPE_RX_BYTES;
@@ -442,6 +443,7 @@ static void handle_getTotalStats(const struct binder_transaction_data* tr,
 
 static void handle_transaction(const struct binder_transaction_data* tr) {
     uint8_t reply_data[2048];
+    uint8_t* reply_data_rp = reply_data;
     size_t reply_size = 0;
 
     char logbuf[128];
@@ -457,11 +459,8 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             break;
         default:
             log_msg("  unsupported code, returning empty");
-            reply_data[0] = 0; reply_data[1] = 0;
-            reply_data[2] = 0;
-            reply_data[3] = 0;
-            write_uint64((uint8_t**)&reply_data + 4, 0);
-            reply_size = 12;
+            write_no_exception(&reply_data_rp);
+            reply_size = (size_t)(reply_data_rp - reply_data);
             break;
     }
 
@@ -470,20 +469,21 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
 
     *(uint32_t*)rwp = BC_REPLY; rwp += 4;
 
-    struct binder_transaction_data rtr;
-    memset(&rtr, 0, sizeof(rtr));
-    rtr.target.ptr = 0;
-    rtr.cookie = tr->cookie;
-    rtr.code = 0;
-    rtr.flags = 0;
-    rtr.data.ptr.buffer = (binder_uintptr_t)(uintptr_t)rwp;
-    rtr.data_size = (uint32_t)reply_size;
+    struct binder_transaction_data* rtr = (struct binder_transaction_data*)rwp;
+    memset(rtr, 0, sizeof(*rtr));
+    rtr->target.ptr = 0;
+    rtr->cookie = tr->cookie;
+    rtr->code = 0;
+    rtr->flags = 0;
+    rtr->data_size = (uint32_t)reply_size;
+    rwp += sizeof(*rtr);
+
+    rtr->data.ptr.buffer = (binder_uintptr_t)(uintptr_t)rwp;
 
     memcpy(rwp, reply_data, reply_size);
     rwp += reply_size;
 
-    size_t write_len = 4 + sizeof(rtr) + reply_size;
-    *(uint32_t*)(rwbuf + 4 + offsetof(struct binder_transaction_data, data_size)) = (uint32_t)reply_size;
+    size_t write_len = (size_t)(rwp - rwbuf);
 
     struct binder_write_read bwr;
     memset(&bwr, 0, sizeof(bwr));
@@ -513,7 +513,7 @@ uint32_t enter_looper() {
         return 0;
     }
     log_msg("BC_ENTER_LOOPER OK");
-    return bwr.read_consumed;
+    return 1;
 }
 
 int main(void) {

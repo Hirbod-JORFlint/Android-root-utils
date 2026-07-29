@@ -1,11 +1,17 @@
 param(
-    [string]$NDKPath = "G:\EvoX\ims\android-ndk-r27c"
+    [string]$NDKPath = "G:\EvoX\ims\android-ndk-r27c",
+    [string]$SevenZip = "C:\Program Files\7-Zip\7z.exe"
 )
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Src = "$ScriptDir\src"
 $Mod = "$ScriptDir\module"
 $Out = "$ScriptDir"
+
+if (-not (Test-Path $SevenZip)) {
+    Write-Error "7z not found at $SevenZip. Install 7-Zip or set -SevenZip path."
+    exit 1
+}
 
 $Toolchain = "$NDKPath\toolchains\llvm\prebuilt\windows-x86_64\bin"
 if (-not (Test-Path "$Toolchain\aarch64-linux-android21-clang.cmd")) {
@@ -14,6 +20,7 @@ if (-not (Test-Path "$Toolchain\aarch64-linux-android21-clang.cmd")) {
 }
 
 Write-Output "Using NDK: $NDKPath"
+Write-Output "Using 7z: $SevenZip"
 
 Remove-Item -Path "$Mod\system\bin\netproxy" -ErrorAction SilentlyContinue
 Remove-Item -Path "$Mod\system\bin\netproxy_arm" -ErrorAction SilentlyContinue
@@ -21,79 +28,76 @@ New-Item -ItemType Directory -Path "$Mod\system\bin" -Force | Out-Null
 
 Write-Output "Compiling ARM64..."
 & "$Toolchain\aarch64-linux-android21-clang.cmd" -o "$Mod\system\bin\netproxy" -O2 -s -static "$Src\netproxy.c" 2>&1
-if ($?) {
-    $size = (Get-Item "$Mod\system\bin\netproxy").Length
-    Write-Output "  ARM64: $size bytes"
-} else {
-    Write-Error "ARM64 compilation failed!"
-    exit 1
-}
+if (-not $?) { Write-Error "ARM64 compilation failed!"; exit 1 }
+$size = (Get-Item "$Mod\system\bin\netproxy").Length
+Write-Output "  ARM64: $size bytes"
 
 Write-Output "Compiling ARM32..."
 & "$Toolchain\armv7a-linux-androideabi21-clang.cmd" -o "$Mod\system\bin\netproxy_arm" -O2 -s -static "$Src\netproxy.c" 2>&1
-if ($?) {
-    $size = (Get-Item "$Mod\system\bin\netproxy_arm").Length
-    Write-Output "  ARM32: $size bytes"
-} else {
-    Write-Error "ARM32 compilation failed!"
-    exit 1
+if (-not $?) { Write-Error "ARM32 compilation failed!"; exit 1 }
+$size = (Get-Item "$Mod\system\bin\netproxy_arm").Length
+Write-Output "  ARM32: $size bytes"
+
+function Build-ModuleZip {
+    param([string]$OutputZip, [string]$TempSuffix, [scriptblock]$Customize)
+
+    $tmpDir = "$env:TEMP\netstats-fix-build-$TempSuffix"
+    Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+
+    Get-ChildItem -Path $Mod | Where-Object { $_.Name -notmatch '\.git' } | ForEach-Object {
+        if ($_.PSIsContainer) {
+            $dest = "$tmpDir\$($_.Name)"
+            Copy-Item -Path $_.FullName -Destination $dest -Recurse -Force
+        } else {
+            Copy-Item -Path $_.FullName -Destination "$tmpDir\$($_.Name)" -Force
+        }
+    }
+
+    if ($Customize) { Invoke-Command $Customize }
+
+    Remove-Item -Path $OutputZip -ErrorAction SilentlyContinue
+
+    # Build list of files relative to tmpDir with forward slashes
+    $fileList = @()
+    Get-ChildItem -Path $tmpDir -Recurse -File | ForEach-Object {
+        $rel = $_.FullName.Substring($tmpDir.Length).TrimStart('\')
+        $rel = $rel.Replace('\', '/')
+        $fileList += $rel
+    }
+
+    $listFilePath = "$tmpDir\filelist.txt"
+    $fileList | Out-File -FilePath $listFilePath -Encoding ascii
+
+    Push-Location $tmpDir
+    & $SevenZip a -tzip -mx=9 "$OutputZip" "@$listFilePath" 2>&1
+    Pop-Location
+
+    if ($?) {
+        Write-Output "  Created: $OutputZip"
+    } else {
+        Write-Error "  7z failed for $OutputZip"
+    }
+
+    Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output "Building full module..."
-$FullZip = "$Out\netstats-fix-v10.zip"
-Remove-Item -Path $FullZip -ErrorAction SilentlyContinue
-
-# Use a temp dir approach for precise control
-$tmpDir = "$env:TEMP\netstats-fix-build"
-Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-
-# Copy module files, excluding lite and arm variants
-Get-ChildItem -Path $Mod | Where-Object { $_.Name -notmatch '_lite' -and $_.Name -notlike '*.git*' } | ForEach-Object {
-    if ($_.PSIsContainer) {
-        Copy-Item -Path $_.FullName -Destination "$tmpDir\$($_.Name)" -Recurse -Force
-    } else {
-        Copy-Item -Path $_.FullName -Destination "$tmpDir\$($_.Name)" -Force
-    }
+Build-ModuleZip -OutputZip "$Out\netstats-fix-v10.zip" -TempSuffix "full" -Customize {
+    Remove-Item "$tmpDir\service_lite.sh" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$tmpDir\post-fs-data_lite.sh" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$tmpDir\module_lite.prop" -Force -ErrorAction SilentlyContinue
 }
-
-# Keep ARM binary in full module for compatibility
-
-Compress-Archive -Path "$tmpDir\*" -DestinationPath $FullZip -CompressionLevel Optimal
-Write-Output "  Created: $FullZip"
 
 Write-Output "Building lite module..."
-$LiteZip = "$Out\netstats-fix-v10-lite.zip"
-Remove-Item -Path $LiteZip -ErrorAction SilentlyContinue
-
-$tmpDirLite = "$env:TEMP\netstats-fix-build-lite"
-Remove-Item -Path $tmpDirLite -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Path $tmpDirLite -Force | Out-Null
-
-# Copy module files with lite renaming
-Get-ChildItem -Path $Mod | Where-Object { $_.Name -notmatch '\.git' } | ForEach-Object {
-    if ($_.PSIsContainer) {
-        Copy-Item -Path $_.FullName -Destination "$tmpDirLite\$($_.Name)" -Recurse -Force
-    } else {
-        Copy-Item -Path $_.FullName -Destination "$tmpDirLite\$($_.Name)" -Force
-    }
+Build-ModuleZip -OutputZip "$Out\netstats-fix-v10-lite.zip" -TempSuffix "lite" -Customize {
+    Remove-Item "$tmpDir\service.sh", "$tmpDir\post-fs-data.sh", "$tmpDir\module.prop" -Force -ErrorAction SilentlyContinue
+    Move-Item "$tmpDir\service_lite.sh" "$tmpDir\service.sh" -Force
+    Move-Item "$tmpDir\post-fs-data_lite.sh" "$tmpDir\post-fs-data.sh" -Force
+    Move-Item "$tmpDir\module_lite.prop" "$tmpDir\module.prop" -Force
 }
-
-# Rename for lite
-Copy-Item "$tmpDirLite\service_lite.sh" "$tmpDirLite\service.sh" -Force
-Copy-Item "$tmpDirLite\post-fs-data_lite.sh" "$tmpDirLite\post-fs-data.sh" -Force
-Copy-Item "$tmpDirLite\module_lite.prop" "$tmpDirLite\module.prop" -Force
-Remove-Item "$tmpDirLite\service_lite.sh", "$tmpDirLite\post-fs-data_lite.sh", "$tmpDirLite\module_lite.prop" -ErrorAction SilentlyContinue
-# Keep ARM binary in lite module for compatibility
-
-Compress-Archive -Path "$tmpDirLite\*" -DestinationPath $LiteZip -CompressionLevel Optimal
-Write-Output "  Created: $LiteZip"
-
-# Cleanup
-Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path $tmpDirLite -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Output ""
 Write-Output "Done! Modules built:"
-Write-Output "  $FullZip"
-Write-Output "  $LiteZip"
+Write-Output "  $Out\netstats-fix-v10.zip"
+Write-Output "  $Out\netstats-fix-v10-lite.zip"

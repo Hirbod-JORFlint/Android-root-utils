@@ -1,13 +1,9 @@
 #!/bin/bash
-# Build script for Network Stats Fix module
-# Requires Android NDK r27+ in $NDK or ../ims/android-ndk-r27c
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$SCRIPT_DIR/src"
 MOD="$SCRIPT_DIR/module"
 OUT="$SCRIPT_DIR"
 
-# Find NDK
 if [ -z "$NDK" ]; then
     if [ -d "$SCRIPT_DIR/../ims/android-ndk-r27c" ]; then
         NDK="$SCRIPT_DIR/../ims/android-ndk-r27c"
@@ -29,11 +25,9 @@ fi
 echo "Using NDK: $NDK"
 echo "Toolchain: $TOOLCHAIN"
 
-# Clean old binary
 rm -f "$MOD/system/bin/netproxy" "$MOD/system/bin/netproxy_arm"
 mkdir -p "$MOD/system/bin"
 
-# Compile ARM64
 echo "Compiling ARM64..."
 "$TOOLCHAIN/bin/aarch64-linux-android21-clang" \
     -o "$MOD/system/bin/netproxy" \
@@ -45,7 +39,6 @@ else
     exit 1
 fi
 
-# Compile ARM32
 echo "Compiling ARM32..."
 "$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang" \
     -o "$MOD/system/bin/netproxy_arm" \
@@ -59,26 +52,32 @@ fi
 
 # Build full module zip
 echo "Building full module..."
-cd "$MOD"
+FULL_TMP=$(mktemp -d)
+cp -r "$MOD/"* "$FULL_TMP/"
+rm -f "$FULL_TMP/service_lite.sh" "$FULL_TMP/post-fs-data_lite.sh" "$FULL_TMP/module_lite.prop"
+cd "$FULL_TMP"
 FULL_ZIP="$OUT/netstats-fix-v10.zip"
 rm -f "$FULL_ZIP"
-zip -r9 "$FULL_ZIP" . -x "*.git*" "*.sh" "*_lite.*" "system/bin/netproxy_arm"
+find . -type f | sed 's|^\./||' | sort | zip -r9 -@ "$FULL_ZIP"
 echo "  Created: $FULL_ZIP"
+cd "$SCRIPT_DIR"
+rm -rf "$FULL_TMP"
 
-# Build lite module zip (no BPF, proxy only)
+# Build lite module zip
 echo "Building lite module..."
+LITE_TMP=$(mktemp -d)
+cp -r "$MOD/"* "$LITE_TMP/"
+rm -f "$LITE_TMP/service.sh" "$LITE_TMP/post-fs-data.sh" "$LITE_TMP/module.prop"
+mv "$LITE_TMP/service_lite.sh" "$LITE_TMP/service.sh"
+mv "$LITE_TMP/post-fs-data_lite.sh" "$LITE_TMP/post-fs-data.sh"
+mv "$LITE_TMP/module_lite.prop" "$LITE_TMP/module.prop"
+cd "$LITE_TMP"
 LITE_ZIP="$OUT/netstats-fix-v10-lite.zip"
 rm -f "$LITE_ZIP"
-# Use full contents but with lite scripts
-cp "$MOD/service_lite.sh" "$MOD/service.sh"
-cp "$MOD/post-fs-data_lite.sh" "$MOD/post-fs-data.sh"
-cp "$MOD/module_lite.prop" "$MOD/module.prop"
-zip -r9 "$LITE_ZIP" . -x "*.git*" "*.sh" "system/bin/netproxy_arm"
+find . -type f | sed 's|^\./||' | sort | zip -r9 -@ "$LITE_ZIP"
 echo "  Created: $LITE_ZIP"
-
-# Restore full scripts
-git checkout -- "$MOD/service.sh" "$MOD/post-fs-data.sh" "$MOD/module.prop" 2>/dev/null || \
-    cp "$MOD/service.sh" "$MOD/service.sh.bak" 2>/dev/null || true
+cd "$SCRIPT_DIR"
+rm -rf "$LITE_TMP"
 
 echo ""
 echo "Done! Modules built:"
