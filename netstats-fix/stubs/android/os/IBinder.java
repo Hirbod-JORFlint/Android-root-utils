@@ -12,7 +12,6 @@ public interface IBinder {
     int PING_TRANSACTION = 0x504e4700;
     int INTERFACE_TRANSACTION = 0x5f4e5446;
     int FLAG_ONEWAY = 0x00000001;
-    int FLAG_CLEAR_BUF = 0x00000002;
 
     String getInterfaceDescriptor() throws RemoteException;
     boolean pingBinder();
@@ -24,7 +23,5 @@ public interface IBinder {
     boolean linkToDeath(DeathRecipient recipient, int flags);
     boolean unlinkToDeath(DeathRecipient recipient, int flags);
 
-    interface DeathRecipient {
-        void binderDied();
-    }
+    interface DeathRecipient { void binderDied(); }
 }

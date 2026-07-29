@@ -1,13 +1,13 @@
 package com.flint.netstats;
 
 import android.os.Binder;
-import android.os.BinderInternal;
 import android.os.IBinder;
 import android.os.Parcel;
 import android.os.ServiceManager;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.lang.reflect.Method;
 
 public class NetworkStatsProxy extends Binder {
     private static final String DESCRIPTOR = "android.net.INetworkStatsService";
@@ -16,15 +16,23 @@ public class NetworkStatsProxy extends Binder {
     private static final int TX_getIfaceStats  = 12;
     private static final int TX_getTotalStats  = 13;
 
+    static {
+        System.loadLibrary("binder_pool");
+    }
+
+    private static native void nativeJoinThreadPool();
+
     private IBinder original;
-    private boolean registered;
+    private volatile boolean poolReady;
 
     public NetworkStatsProxy() {
         attachInterface(null, DESCRIPTOR);
         this.original = ServiceManager.getService("netstats");
+    }
+
+    private void register() {
         ServiceManager.addService("netstats", this);
-        this.registered = true;
-        log("proxy registered. original=" + (original != null));
+        log("registered. original=" + (original != null));
     }
 
     public boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
@@ -135,13 +143,45 @@ public class NetworkStatsProxy extends Binder {
         return false;
     }
 
+    // --- Logging ---
+
     static void log(String m) {
+        String msg = "NetProxy: " + m;
+        // Write to file
         try {
             FileWriter fw = new FileWriter(LOGFILE, true);
-            fw.write("NetProxy: " + m + "\n");
+            fw.write(msg + "\n");
             fw.close();
         } catch (Exception ignored) {}
+        // Write to logcat via reflection
+        try {
+            Class<?> logCls = Class.forName("android.util.Log");
+            Method i = logCls.getMethod("i", String.class, String.class);
+            i.invoke(null, "NetProxy", m);
+        } catch (Exception ignored) {}
     }
+
+    // --- Binder thread pool (native JNI via libbinder.so) ---
+
+    private boolean startPool() {
+        try {
+            Thread t = new Thread(() -> {
+                log("pool thread starting...");
+                nativeJoinThreadPool();
+                log("pool thread exited (unexpected)");
+            }, "binder-pool");
+            t.start();
+            Thread.sleep(500);
+            log("pool thread started");
+            poolReady = t.isAlive();
+            return poolReady;
+        } catch (Exception e) {
+            log("startPool failed: " + e);
+            return false;
+        }
+    }
+
+    // --- Entry point ---
 
     public static void main(String[] args) {
         try {
@@ -150,17 +190,29 @@ public class NetworkStatsProxy extends Binder {
 
             IBinder svc = ServiceManager.getService("netstats");
             if (svc == null) {
-                log("netstats service not found - system_server not ready yet");
+                log("netstats service not found - system_server not ready");
                 return;
             }
+            log("found netstats service");
 
             NetworkStatsProxy p = new NetworkStatsProxy();
 
-            IBinder check = ServiceManager.getService("netstats");
-            log("self-check: getService returned " + (check != null ? "non-null" : "null"));
+            if (!p.startPool()) {
+                log("FATAL: cannot start binder pool, not registering");
+                return;
+            }
 
-            log("starting binder thread pool...");
-            BinderInternal.joinThreadPool();
+            p.register();
+
+            // Keep alive
+            log("proxy active, entering keepalive");
+            while (true) {
+                Thread.sleep(60000);
+                if (!p.poolReady) {
+                    log("pool died, exiting");
+                    break;
+                }
+            }
         } catch (Exception e) {
             log("fatal: " + e);
             try {

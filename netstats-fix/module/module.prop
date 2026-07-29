@@ -1,6 +1,6 @@
 id=netstats-fix
 name=Network Stats Fix for GSI
-version=v7
-versionCode=7
+version=v8
+versionCode=8
 author=Flint
-description=Universal Binder-level fix for broken traffic indicator on Android 16 GSIs. Intercepts INetworkStatsService (getIfaceStats/getTotalStats) and reads /proc/net/dev directly — works on all kernels, no SystemUI modification needed.
+description=Binder-level fix for broken traffic indicator on Android 16 GSIs. Uses native JNI binder thread pool to intercept INetworkStatsService and read /proc/net/dev directly.

@@ -1,11 +1,5 @@
 #!/system/bin/sh
-# post-fs-data.sh - Early boot initialization for netstats-fix v7
-# Runs after /data is decrypted
-
-# Ensure /proc/net/dev is world-readable (proxy needs this)
 chmod 0644 /proc/net/dev 2>/dev/null
-
-# Load xt_qtaguid module early for kernels <5.0
 KERNEL_MAJOR=$(uname -r 2>/dev/null | cut -d. -f1)
 KERNEL_MAJOR=${KERNEL_MAJOR:-0}
 if [ "$KERNEL_MAJOR" -lt 5 ] 2>/dev/null; then
@@ -15,5 +9,4 @@ if [ "$KERNEL_MAJOR" -lt 5 ] 2>/dev/null; then
     [ ! -e /dev/xt_qtaguid ] && mknod /dev/xt_qtaguid c 10 229 2>/dev/null
     chmod 0666 /dev/xt_qtaguid 2>/dev/null
 fi
-
 exit 0
