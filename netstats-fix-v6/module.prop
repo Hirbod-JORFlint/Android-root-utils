@@ -1,6 +1,0 @@
-id=netstats-fix
-name=Network Stats Fix for GSI
-version=v6
-versionCode=6
-author=opencode
-description=Universal fix for broken traffic indicator and per-UID network stats on Android 16 GSIs. Patches SystemUI to read /proc/net/dev directly (works on all kernels), adds sepolicy rules for bpfloader, and provides xt_qtaguid fallback for kernels <5.0.
