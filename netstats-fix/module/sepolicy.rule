@@ -4,3 +4,6 @@ allow bpfloader bpffs:file { create read write open map };
 allow system_app proc_net:file { read open getattr };
 allow netd qtaguid_device:chr_file { read write open ioctl };
 allow bpfloader self:capability { sys_ptrace };
+allow app_process binder_device:chr_file { read write open ioctl };
+allow shell binder_device:chr_file { read write open ioctl };
+allow shell binder:service_manager { find add };

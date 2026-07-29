@@ -20,7 +20,9 @@ public class NetworkStatsProxy extends Binder {
         System.loadLibrary("binder_pool");
     }
 
-    private static native void nativeJoinThreadPool();
+    // Returns: 0=joined, 1=dlopen fail, 2=dlsym self fail, 3=dlsym join fail,
+    //          4=self NULL, 5=join returned, 6=partial symbols
+    private static native int nativeJoinThreadPool();
 
     private IBinder original;
     private volatile boolean poolReady;
@@ -167,14 +169,17 @@ public class NetworkStatsProxy extends Binder {
         try {
             Thread t = new Thread(() -> {
                 log("pool thread starting...");
-                nativeJoinThreadPool();
-                log("pool thread exited (unexpected)");
+                int rc = nativeJoinThreadPool();
+                log("nativeJoinThreadPool returned code=" + rc);
             }, "binder-pool");
             t.start();
-            Thread.sleep(500);
-            log("pool thread started");
+            Thread.sleep(1000);
             poolReady = t.isAlive();
+            log("pool thread started, alive=" + poolReady);
             return poolReady;
+        } catch (UnsatisfiedLinkError e) {
+            log("startPool UnsatisfiedLinkError: " + e);
+            return false;
         } catch (Exception e) {
             log("startPool failed: " + e);
             return false;
