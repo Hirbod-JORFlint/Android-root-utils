@@ -27,13 +27,13 @@ Remove-Item -Path "$Mod\system\bin\netproxy_arm" -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path "$Mod\system\bin" -Force | Out-Null
 
 Write-Output "Compiling ARM64..."
-& "$Toolchain\aarch64-linux-android21-clang.cmd" -o "$Mod\system\bin\netproxy" -O2 -s -static "$Src\netproxy.c" 2>&1
+& "$Toolchain\aarch64-linux-android21-clang.cmd" -o "$Mod\system\bin\netproxy" -O2 -s -fPIE -pie "$Src\netproxy.c" 2>&1
 if (-not $?) { Write-Error "ARM64 compilation failed!"; exit 1 }
 $size = (Get-Item "$Mod\system\bin\netproxy").Length
 Write-Output "  ARM64: $size bytes"
 
 Write-Output "Compiling ARM32..."
-& "$Toolchain\armv7a-linux-androideabi21-clang.cmd" -o "$Mod\system\bin\netproxy_arm" -O2 -s -static "$Src\netproxy.c" 2>&1
+& "$Toolchain\armv7a-linux-androideabi21-clang.cmd" -o "$Mod\system\bin\netproxy_arm" -O2 -s -fPIE -pie "$Src\netproxy.c" 2>&1
 if (-not $?) { Write-Error "ARM32 compilation failed!"; exit 1 }
 $size = (Get-Item "$Mod\system\bin\netproxy_arm").Length
 Write-Output "  ARM32: $size bytes"

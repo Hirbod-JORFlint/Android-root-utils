@@ -31,7 +31,7 @@ mkdir -p "$MOD/system/bin"
 echo "Compiling ARM64..."
 "$TOOLCHAIN/bin/aarch64-linux-android21-clang" \
     -o "$MOD/system/bin/netproxy" \
-    -O2 -s -static "$SRC/netproxy.c"
+    -O2 -s -fPIE -pie "$SRC/netproxy.c"
 if [ $? -eq 0 ] && [ -f "$MOD/system/bin/netproxy" ]; then
     echo "  ARM64: $(stat -c%s "$MOD/system/bin/netproxy") bytes"
 else
@@ -42,7 +42,7 @@ fi
 echo "Compiling ARM32..."
 "$TOOLCHAIN/bin/armv7a-linux-androideabi21-clang" \
     -o "$MOD/system/bin/netproxy_arm" \
-    -O2 -s -static "$SRC/netproxy.c"
+    -O2 -s -fPIE -pie "$SRC/netproxy.c"
 if [ $? -eq 0 ] && [ -f "$MOD/system/bin/netproxy_arm" ]; then
     echo "  ARM32: $(stat -c%s "$MOD/system/bin/netproxy_arm") bytes"
 else
