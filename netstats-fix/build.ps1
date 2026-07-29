@@ -1,55 +1,99 @@
-param([string]$NdkRoot="G:\EvoX\ims\android-ndk-r27c")
-$ErrorActionPreference="Stop"
-$Root=Split-Path -Parent $MyInvocation.MyCommand.Path
-$ModuleDir = "$Root\module"
+param(
+    [string]$NDKPath = "G:\EvoX\ims\android-ndk-r27c"
+)
 
-$cc = "$NdkRoot\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android21-clang.cmd"
-$src = "$Root\src\netproxy.c"
-$bin = "$ModuleDir\system\bin\netproxy"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Src = "$ScriptDir\src"
+$Mod = "$ScriptDir\module"
+$Out = "$ScriptDir"
 
-Write-Host "=== Compiling netproxy.c ==="
-& $cc -O2 -Wall -o $bin $src 2>&1
-if (-not $?) { throw "compilation failed" }
-Write-Host "Binary size: $((Get-Item $bin).Length) bytes"
-Write-Host ""
-
-function Build-Zip {
-    param([string]$ZipName, [string]$PropSrc, [string]$ServiceSrc, [string]$PostFsSrc)
-    $zip = "$Root\$ZipName"
-    if (Test-Path $zip) { Remove-Item $zip -Force }
-    $staging = "$Root\staging"
-    if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
-    New-Item -ItemType Directory -Path "$staging\system\bin" -Force | Out-Null
-
-    Copy-Item "$ModuleDir\$PropSrc" "$staging\module.prop"
-    Copy-Item "$ModuleDir\customize.sh" "$staging\customize.sh"
-    Copy-Item "$ModuleDir\sepolicy.rule" "$staging\sepolicy.rule"
-    Copy-Item "$ModuleDir\$PostFsSrc" "$staging\post-fs-data.sh"
-    Copy-Item "$ModuleDir\$ServiceSrc" "$staging\service.sh"
-    Copy-Item "$ModuleDir\system\bin\netproxy" "$staging\system\bin\netproxy"
-
-    Push-Location $staging
-    try {
-        & "C:\Program Files\7-Zip\7z.exe" a -mx=9 $zip * -r 2>&1 | Out-Null
-    } finally {
-        Pop-Location
-    }
-    Remove-Item $staging -Recurse -Force
-    Write-Host "Built: $zip ($((Get-Item $zip).Length/1KB) KB)"
+$Toolchain = "$NDKPath\toolchains\llvm\prebuilt\windows-x86_64\bin"
+if (-not (Test-Path "$Toolchain\aarch64-linux-android21-clang.cmd")) {
+    Write-Error "NDK not found at $NDKPath or toolchain missing"
+    exit 1
 }
 
-Write-Host "=== Building full module (BPF repair + proxy) ==="
-Build-Zip -ZipName "netstats-fix-v10.zip" `
-          -PropSrc "module.prop" `
-          -ServiceSrc "service.sh" `
-          -PostFsSrc "post-fs-data.sh"
+Write-Output "Using NDK: $NDKPath"
 
-Write-Host ""
-Write-Host "=== Building lite module (proxy only, no BPF) ==="
-Build-Zip -ZipName "netstats-fix-v10-lite.zip" `
-          -PropSrc "module_lite.prop" `
-          -ServiceSrc "service_lite.sh" `
-          -PostFsSrc "post-fs-data_lite.sh"
+Remove-Item -Path "$Mod\system\bin\netproxy" -ErrorAction SilentlyContinue
+Remove-Item -Path "$Mod\system\bin\netproxy_arm" -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path "$Mod\system\bin" -Force | Out-Null
 
-Write-Host ""
-Write-Host "Done."
+Write-Output "Compiling ARM64..."
+& "$Toolchain\aarch64-linux-android21-clang.cmd" -o "$Mod\system\bin\netproxy" -O2 -s -static "$Src\netproxy.c" 2>&1
+if ($?) {
+    $size = (Get-Item "$Mod\system\bin\netproxy").Length
+    Write-Output "  ARM64: $size bytes"
+} else {
+    Write-Error "ARM64 compilation failed!"
+    exit 1
+}
+
+Write-Output "Compiling ARM32..."
+& "$Toolchain\armv7a-linux-androideabi21-clang.cmd" -o "$Mod\system\bin\netproxy_arm" -O2 -s -static "$Src\netproxy.c" 2>&1
+if ($?) {
+    $size = (Get-Item "$Mod\system\bin\netproxy_arm").Length
+    Write-Output "  ARM32: $size bytes"
+} else {
+    Write-Error "ARM32 compilation failed!"
+    exit 1
+}
+
+Write-Output "Building full module..."
+$FullZip = "$Out\netstats-fix-v10.zip"
+Remove-Item -Path $FullZip -ErrorAction SilentlyContinue
+
+# Use a temp dir approach for precise control
+$tmpDir = "$env:TEMP\netstats-fix-build"
+Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+
+# Copy module files, excluding lite and arm variants
+Get-ChildItem -Path $Mod | Where-Object { $_.Name -notmatch '_lite' -and $_.Name -notlike '*.git*' } | ForEach-Object {
+    if ($_.PSIsContainer) {
+        Copy-Item -Path $_.FullName -Destination "$tmpDir\$($_.Name)" -Recurse -Force
+    } else {
+        Copy-Item -Path $_.FullName -Destination "$tmpDir\$($_.Name)" -Force
+    }
+}
+
+# Keep ARM binary in full module for compatibility
+
+Compress-Archive -Path "$tmpDir\*" -DestinationPath $FullZip -CompressionLevel Optimal
+Write-Output "  Created: $FullZip"
+
+Write-Output "Building lite module..."
+$LiteZip = "$Out\netstats-fix-v10-lite.zip"
+Remove-Item -Path $LiteZip -ErrorAction SilentlyContinue
+
+$tmpDirLite = "$env:TEMP\netstats-fix-build-lite"
+Remove-Item -Path $tmpDirLite -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $tmpDirLite -Force | Out-Null
+
+# Copy module files with lite renaming
+Get-ChildItem -Path $Mod | Where-Object { $_.Name -notmatch '\.git' } | ForEach-Object {
+    if ($_.PSIsContainer) {
+        Copy-Item -Path $_.FullName -Destination "$tmpDirLite\$($_.Name)" -Recurse -Force
+    } else {
+        Copy-Item -Path $_.FullName -Destination "$tmpDirLite\$($_.Name)" -Force
+    }
+}
+
+# Rename for lite
+Copy-Item "$tmpDirLite\service_lite.sh" "$tmpDirLite\service.sh" -Force
+Copy-Item "$tmpDirLite\post-fs-data_lite.sh" "$tmpDirLite\post-fs-data.sh" -Force
+Copy-Item "$tmpDirLite\module_lite.prop" "$tmpDirLite\module.prop" -Force
+Remove-Item "$tmpDirLite\service_lite.sh", "$tmpDirLite\post-fs-data_lite.sh", "$tmpDirLite\module_lite.prop" -ErrorAction SilentlyContinue
+# Keep ARM binary in lite module for compatibility
+
+Compress-Archive -Path "$tmpDirLite\*" -DestinationPath $LiteZip -CompressionLevel Optimal
+Write-Output "  Created: $LiteZip"
+
+# Cleanup
+Remove-Item -Path $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $tmpDirLite -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Output ""
+Write-Output "Done! Modules built:"
+Write-Output "  $FullZip"
+Write-Output "  $LiteZip"
