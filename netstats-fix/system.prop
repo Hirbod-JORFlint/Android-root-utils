@@ -1,5 +1,0 @@
-ro.net.stats=1
-persist.sys.netstats=1
-persist.sys.nobpf=false
-net.rmnet0.dns1=8.8.8.8
-net.rmnet0.dns2=8.8.4.4

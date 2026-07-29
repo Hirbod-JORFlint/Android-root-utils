@@ -1,0 +1,15 @@
+# Allow init to execute bpfloader binary (fixes 'getattr' denial on Axion OS)
+allow init bpfloader_exec:file { getattr open read execute execute_no_trans };
+
+# Allow bpfloader to access /sys/fs/bpf
+allow bpfloader bpffs:dir { search read write add_name remove_name };
+allow bpfloader bpffs:file { create read write open map };
+
+# Allow system apps (SystemUI) to read /proc/net/dev
+allow system_app proc_net:file { read open getattr };
+
+# Allow netd to manage xt_qtaguid (legacy fallback)
+allow netd qtaguid_device:chr_file { read write open ioctl };
+
+# Fix 'ptrace' denial on Axion (bpfloader tracing)
+allow bpfloader self:capability { sys_ptrace };

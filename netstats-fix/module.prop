@@ -1,6 +1,0 @@
-id=netstats-fix
-name=Network Stats Fix (Universal GSI)
-version=v5.0
-versionCode=9
-author=Flint
-description=Fixes broken network traffic indicator and per-UID network stats on Android 12-16 GSIs. v5.0 fixes critical BPF map name detection, removes dangerous setenforce 0 that caused boot loops on Infinity X/Huawei devices, adds targeted SELinux policies for netd BPF map access, and improves cross-device compatibility for EvoX, Infinity X, Axion OS, and other Treble GSIs.
