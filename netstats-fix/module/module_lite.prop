@@ -1,6 +1,6 @@
 id=netstats-fix-lite
 name=Network Stats Fix (Proxy Only - Lite)
-version=v10-lite
-versionCode=10
-author=opencode
-description=Lightweight native binder proxy fix for broken traffic indicator. No BPF restoration (safe for devices where BPF causes 'no internet'). Reads /proc/net/dev directly via binder interception. Suitable for legacy kernels (<4.9) and devices with SELinux restrictions.
+version=v11-lite
+versionCode=11
+author=Hirbod-JORFlint
+description=Lightweight native binder proxy fix for broken traffic indicator. No BPF restoration. Safe for devices where BPF causes 'no internet'. Reads /proc/net/dev directly via binder interception. Fixed enter_looper for reliable ServiceManager registration.

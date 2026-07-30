@@ -2,79 +2,105 @@
 MODDIR=${0%/*}
 LOG=/data/local/tmp/netproxy.log
 
-echo "$(date) [post-fs-data] === started ===" > "$LOG"
+_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [post-fs-data] $*" >> "$LOG"; }
 
-echo "$(date) [post-fs-data] Kernel: $(uname -r)" >> "$LOG"
-echo "$(date) [post-fs-data] Android: $(getprop ro.build.version.sdk 2>/dev/null)" >> "$LOG"
-echo "$(date) [post-fs-data] Build: $(getprop ro.build.display.id 2>/dev/null || getprop ro.lineage.build.version 2>/dev/null || echo 'unknown')" >> "$LOG"
+echo "" > "$LOG" 2>/dev/null || true
+chmod 0666 "$LOG" 2>/dev/null
 
-# Make /proc/net/dev world-readable
+_log "=== post-fs-data.sh started ==="
+
+KVER=$(uname -r 2>/dev/null)
+KMAJOR=$(echo "$KVER" | cut -d. -f1)
+KMINOR=$(echo "$KVER" | cut -d. -f2)
+KPATCH=$(echo "$KVER" | cut -d. -f3 | grep -oE '^[0-9]+')
+KMAJOR=${KMAJOR:-0}; KMINOR=${KMINOR:-0}; KPATCH=${KPATCH:-0}
+
+_log "Kernel: $KVER"
+_log "Android: $(getprop ro.build.version.sdk 2>/dev/null) (SDK $(getprop ro.build.version.sdk 2>/dev/null))"
+_log "SELinux: $(getenforce 2>/dev/null || echo unknown)"
+
 chmod 0644 /proc/net/dev 2>/dev/null
 chmod 0644 /proc/self/net/dev 2>/dev/null
 
-KERNEL_MAJOR=$(uname -r 2>/dev/null | cut -d. -f1)
-KERNEL_MAJOR=${KERNEL_MAJOR:-0}
-KERNEL_MINOR=$(uname -r 2>/dev/null | cut -d. -f2)
-KERNEL_MINOR=${KERNEL_MINOR:-0}
-KERNEL_PATCH=$(uname -r 2>/dev/null | cut -d. -f3 | cut -d- -f1)
-KERNEL_PATCH=${KERNEL_PATCH:-0}
-
-echo "$(date) [post-fs-data] Kernel version: $KERNEL_MAJOR.$KERNEL_MINOR.$KERNEL_PATCH" >> "$LOG"
-
-# Override BPF kernel version to match actual kernel
-CURRENT_OVERRIDE=$(getprop ro.bpf.kver_override 2>/dev/null)
-CORRECT_KVER="$KERNEL_MAJOR.$KERNEL_MINOR.$KERNEL_PATCH"
-if [ "$CURRENT_OVERRIDE" != "$CORRECT_KVER" ]; then
-    resetprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null || \
-    resetprop_phh ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null || \
-    setprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null
-    echo "$(date) [post-fs-data] Set ro.bpf.kver_override=$CORRECT_KVER" >> "$LOG"
+BPF_DIR="/sys/fs/bpf"
+BPF_NETD="$BPF_DIR/netd_shared"
+if ! mount | grep -q "bpf on $BPF_DIR"; then
+    mount -t bpf bpf "$BPF_DIR" 2>/dev/null && _log "Mounted bpffs at $BPF_DIR" \
+        || _log "bpffs mount failed (may already be mounted)"
 fi
 
-# Delete mainline_done marker so bpfloader reruns
-BPF_DIR="/sys/fs/bpf/netd_shared"
-[ -d "$BPF_DIR/mainline_done" ] && rm -rf "$BPF_DIR/mainline_done" 2>/dev/null && \
-    echo "$(date) [post-fs-data] Deleted stale mainline_done" >> "$LOG"
-
-# Enable BPF JIT if available
-BPF_JIT_PATH="/proc/sys/net/core/bpf_jit_enable"
-if [ -f "$BPF_JIT_PATH" ]; then
-    echo 1 > "$BPF_JIT_PATH" 2>/dev/null && \
-        echo "$(date) [post-fs-data] BPF JIT enabled" >> "$LOG"
-else
-    # Try sysfs alternative
-    echo 1 > /sys/fs/bpf/jit_enable 2>/dev/null || \
-        echo "$(date) [post-fs-data] BPF JIT not available (non-critical)" >> "$LOG"
+BPF_RESTORE=0
+if   [ "$KMAJOR" -gt 5 ]; then BPF_RESTORE=1
+elif [ "$KMAJOR" -eq 5 ]; then BPF_RESTORE=1
+elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -ge 14 ]; then BPF_RESTORE=1
+elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -ge 9  ]; then BPF_RESTORE=1
 fi
 
-# For kernels >= 4.9, try to load required BPF modules
-if [ "$KERNEL_MAJOR" -gt 4 ] || { [ "$KERNEL_MAJOR" -eq 4 ] && [ "$KERNEL_MINOR" -ge 9 ]; }; then
-    # Try loading BPF-related kernel modules
-    for MOD in netfilter_bpf bpf bpf_prog; do
-        modprobe "$MOD" 2>/dev/null && \
-            echo "$(date) [post-fs-data] Loaded kernel module: $MOD" >> "$LOG"
-    done
-fi
+_log "BPF restore eligible: $BPF_RESTORE (kernel $KMAJOR.$KMINOR)"
 
-# Load xt_qtaguid for legacy kernels (< 5.0)
-if [ "$KERNEL_MAJOR" -lt 5 ] 2>/dev/null; then
-    for MP in /system/lib/modules/xt_qtaguid.ko /vendor/lib/modules/xt_qtaguid.ko \
-              /vendor_dlkm/lib/modules/xt_qtaguid.ko /system_dlkm/lib/modules/xt_qtaguid.ko; do
-        [ -f "$MP" ] && insmod "$MP" 2>/dev/null && \
-            echo "$(date) [post-fs-data] Loaded $MP" >> "$LOG" && break
-    done
-    if [ ! -e /dev/xt_qtaguid ]; then
-        mknod /dev/xt_qtaguid c 10 229 2>/dev/null
+if [ "$BPF_RESTORE" -eq 1 ]; then
+    if [ -d "$BPF_NETD/mainline_done" ]; then
+        rm -rf "$BPF_NETD/mainline_done" 2>/dev/null \
+            && _log "Deleted mainline_done marker" \
+            || _log "WARNING: could not delete mainline_done"
     fi
-    chmod 0666 /dev/xt_qtaguid 2>/dev/null
-    echo "$(date) [post-fs-data] xt_qtaguid fallback ready" >> "$LOG"
+
+    CORRECT_KVER="${KMAJOR}.${KMINOR}.${KPATCH}"
+    CURRENT_OVERRIDE=$(getprop ro.bpf.kver_override 2>/dev/null)
+    if [ "$CURRENT_OVERRIDE" != "$CORRECT_KVER" ]; then
+        _log "ro.bpf.kver_override: $CURRENT_OVERRIDE -> $CORRECT_KVER"
+        resetprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null \
+        || resetprop_phh ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null \
+        || setprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null
+        _log "Set ro.bpf.kver_override=$CORRECT_KVER"
+    fi
+
+    resetprop ro.bpf.enabled 1 2>/dev/null || setprop ro.bpf.enabled 1 2>/dev/null
+    resetprop persist.net.bpf.enable 1 2>/dev/null || true
+    resetprop ro.kernel.ebpf.supported 1 2>/dev/null || true
+
+    if [ -f /proc/sys/net/core/bpf_jit_enable ]; then
+        echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null \
+            && _log "BPF JIT enabled" || _log "BPF JIT sysctl not writable"
+    fi
+
+    BPFL_STATUS=$(getprop init.svc.bpfloader 2>/dev/null)
+    if [ "$BPFL_STATUS" = "stopped" ] || [ "$BPFL_STATUS" = "restarting" ]; then
+        _log "Triggering early bpfloader restart (was: $BPFL_STATUS)"
+        setprop ctl.restart bpfloader 2>/dev/null || start bpfloader 2>/dev/null || true
+    else
+        _log "bpfloader status: ${BPFL_STATUS:-not started} (deferring to service.sh)"
+    fi
+
+    if [ "$KMAJOR" -lt 5 ]; then
+        for MP in \
+            /vendor/lib/modules/xt_qtaguid.ko \
+            /system/lib/modules/xt_qtaguid.ko \
+            /vendor_dlkm/lib/modules/xt_qtaguid.ko \
+            /system_dlkm/lib/modules/xt_qtaguid.ko; do
+            [ -f "$MP" ] && insmod "$MP" 2>/dev/null \
+                && _log "Loaded xt_qtaguid from $MP" && break
+        done
+        [ ! -e /dev/xt_qtaguid ] && mknod /dev/xt_qtaguid c 10 229 2>/dev/null
+        chmod 0666 /dev/xt_qtaguid 2>/dev/null
+    fi
+else
+    _log "Kernel $KMAJOR.$KMINOR < 4.9: skipping BPF ops"
 fi
 
-# Try to restart bpfloader early to gain time
-if [ -f /system/bin/bpfloader ] || [ -f /system_ext/bin/bpfloader ]; then
-    setprop ctl.restart bpfloader 2>/dev/null
-    echo "$(date) [post-fs-data] Early bpfloader restart triggered" >> "$LOG"
+MAP_COUNT=0
+for MAP_NAME in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B; do
+    MAP_PATH="$BPF_NETD/map_netd_${MAP_NAME}"
+    if [ -e "$MAP_PATH" ]; then MAP_COUNT=$((MAP_COUNT + 1)); fi
+done
+_log "BPF maps found: $MAP_COUNT/6"
+[ -f /proc/net/xt_qtaguid/stats ] && _log "xt_qtaguid: present" || _log "xt_qtaguid: not found"
+[ -d /proc/uid_stat ]             && _log "uid_stat: present"   || _log "uid_stat: not found"
+if [ -d /apex/com.android.tethering ] || [ -d /apex/com.android.networking ]; then
+    _log "Tethering APEX: mounted"
+else
+    _log "Tethering APEX: not found"
 fi
 
-echo "$(date) [post-fs-data] === complete ===" >> "$LOG"
+_log "=== post-fs-data.sh complete ==="
 exit 0

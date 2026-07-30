@@ -5,6 +5,8 @@ allow * binder_device:chr_file { read write open ioctl };
 allow * binder:service_manager { find add };
 allow * netd:fd use;
 allow * netd_socket:sock_file write;
+allow * sysfs_bpf:file { read open getattr };
+allow * sysfs_bpf:dir { read search open };
 
 # === SystemUI / system_app reading /proc/net/dev ===
 allow system_app proc_net:file { read open getattr };
@@ -12,33 +14,60 @@ allow system_app proc_net:dir { read search open };
 allow platform_app proc_net:file { read open getattr };
 allow platform_app proc_net:dir { read search open };
 
-# === bpfloader permissions ===
+# === bpfloader execution (all possible contexts) ===
 allow init bpfloader_exec:file { getattr open read execute execute_no_trans };
 allow init bpfloader_platform_exec:file { getattr open read execute execute_no_trans };
-allow bpfloader bpffs:dir { search read write add_name remove_name };
-allow bpfloader bpffs:file { create read write open map getattr };
-allow bpfloader bpffs:lnk_file { read open getattr };
-allow bpfloader self:capability { sys_ptrace };
-allow bpfloader self:capability2 { sys_ptrace };
+allow init apex_file:file { getattr open read execute execute_no_trans };
+allow init apex_exec:file { getattr open read execute execute_no_trans };
+allow init system_file:file { getattr open read execute execute_no_trans };
+
+# === bpfloader SELinux domain permissions ===
+allow bpfloader self:capability { sys_ptrace sys_admin net_admin };
+allow bpfloader self:capability2 { sys_ptrace sys_admin };
 allow bpfloader kernel:system module_request;
+allow bpfloader bpffs:dir { search read write add_name remove_name create rmdir setattr };
+allow bpfloader bpffs:file { create read write open map getattr setattr unlink };
+allow bpfloader bpffs:lnk_file { read open getattr };
 allow bpfloader selinuxfs:file { read open getattr };
 allow bpfloader proc_net:file { read open getattr };
 allow bpfloader proc_net:dir { search read };
+allow bpfloader proc_kallsyms:file { read open getattr };
+allow bpfloader kmsg_device:chr_file { write };
+allow bpfloader sysfs_btf:file { read open getattr };
+allow bpfloader sysfs_btf:dir { search read };
+allow bpfloader sysfs:file { read open getattr };
+allow bpfloader sysfs:dir { search read };
+allow bpfloader tmpfs:file { read write open };
+allow bpfloader tmpfs:dir { search read write add_name create };
+allow bpfloader unlabeled:dir { search read };
+allow bpfloader unlabeled:file { read open getattr };
 
 # === netd permissions for BPF maps ===
-allow netd bpffs:dir { search read write add_name remove_name };
-allow netd bpffs:file { read write open map getattr };
-allow netd bpffs:lnk_file { read open getattr };
-allow netd self:capability { sys_admin };
+allow netd self:capability { sys_admin net_admin };
 allow netd kernel:system module_request;
+allow netd bpffs:dir { search read write add_name remove_name create rmdir };
+allow netd bpffs:file { read write open map getattr setattr };
+allow netd bpffs:lnk_file { read open getattr };
 allow netd proc_net:file { read open getattr };
 allow netd proc_net:dir { search read };
+
+# === system_server permissions for BPF/proc_net ===
+allow system_server self:capability { sys_admin };
+allow system_server bpffs:dir { read search open };
+allow system_server bpffs:file { read open getattr map };
+allow system_server bpffs:lnk_file { read open getattr };
+allow system_server proc_net:file { read open getattr };
+allow system_server proc_net:dir { read search open };
+allow system_server sysfs_bpf:file { read open getattr };
+allow system_server sysfs_bpf:dir { read search open };
 
 # === xt_qtaguid fallback (legacy) ===
 allow netd qtaguid_device:chr_file { read write open ioctl };
 allow system_app qtaguid_device:chr_file { read write open ioctl };
+allow platform_app qtaguid_device:chr_file { read write open ioctl };
 allow netd socket_device:sock_file { read write create open };
 allow system_app socket_device:sock_file { read write open };
+allow platform_app socket_device:sock_file { read write open };
 
 # === Magisk module context permissions ===
 allow magisk proc_net:file { read open getattr };
@@ -60,12 +89,8 @@ allow dumpstate bpfloader:process { ptrace };
 allow shell proc_net:file { read open getattr };
 allow shell proc_net:dir { read search open };
 
-# === General BPF access for system services ===
-allow system_server bpffs:dir { read search };
-allow system_server bpffs:file { read open getattr };
-allow system_server proc_net:file { read open getattr };
-allow system_server proc_net:dir { read search open };
-
 # === allow all domains to read /proc/net/dev (broad but safe) ===
 allow domain proc_net:file { read open getattr };
 allow domain proc_net:dir { read search open };
+allow domain bpffs:file { read open getattr map };
+allow domain bpffs:dir { read search open };
