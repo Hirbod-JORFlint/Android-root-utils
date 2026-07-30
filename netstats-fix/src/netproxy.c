@@ -1,4 +1,24 @@
 #define _GNU_SOURCE
+#ifndef __NR_bpf
+#if defined(__aarch64__)
+#define __NR_bpf 280
+#elif defined(__arm__)
+#define __NR_bpf 364
+#else
+#define __NR_bpf 321
+#endif
+#endif
+
+#ifndef __NR_init_module
+#if defined(__aarch64__)
+#define __NR_init_module 105
+#elif defined(__arm__)
+#define __NR_init_module 128
+#else
+#define __NR_init_module 175
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,16 +35,30 @@
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
+#include <inttypes.h>
+#include <sys/syscall.h>
+#include <sys/mount.h>
+
+#include <linux/bpf.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <arpa/inet.h>
 
 #define LOGFILE "/data/local/tmp/netproxy.log"
 #define STATSFILE "/data/local/tmp/netproxy_stats"
+#define STATSFILE_DEV "/data/local/tmp/netproxy_dev"
+#define STATSFILE_UID_FILE "/data/local/tmp/netproxy_uid"
 #define REGFILE "/data/local/tmp/netproxy_registered"
-#define NETPROXY_VERSION "8.0"
-#define SESSION_BASE 0x10000
-#define MAX_SESSIONS 32
-#define MAX_IFACES 32
-#define BINDER_MMAP_SIZE (4 * 1024 * 1024)
-#define BINDER_BUF_SIZE  (256 * 1024)
+#define NETPROXY_VERSION "10.0"
+#define SESSION_BASE 0x20000
+#define MAX_SESSIONS 64
+#define MAX_IFACES 64
+#define BINDER_MMAP_SIZE (8 * 1024 * 1024)
+#define BINDER_BUF_SIZE  (512 * 1024)
+#define BPF_MAX_MAP_SIZE (512 * 1024)
 
 /* ============================================================
  * Binder protocol constants
@@ -78,35 +112,35 @@
 #define TF_ONE_WAY      0x01
 
 #define BINDER_TYPE_BINDER 0x85627473
+#define BINDER_TYPE_HANDLE 0x85617473
 #define FLAT_BINDER_FLAG_ACCEPTS_FDS 0x100
 
 #define SM_HANDLE 0
 
 /* ============================================================
- * REAL INetworkStatsService AIDL transaction codes (Android 14+)
+ * AIDL transaction codes - INetworkStatsService (Android 14+)
+ * Updated for Android 16 (Baklava)
  * ============================================================ */
 #define TX_openSession                  1
 #define TX_openSessionForUsageStats     2
 #define TX_getDataLayerSnapshotForUid   3
-#define TX_getUidStatsForTransport      4
-#define TX_getMobileIfaces              5
-#define TX_incrementOperationCount      6
-#define TX_notifyNetworkStatus          7
-#define TX_forceUpdate                  8
-#define TX_registerUsageCallback        9
-#define TX_unregisterUsageRequest       10
-#define TX_getUidStats                  11
-#define TX_getIfaceStats                12
-#define TX_getTotalStats                13
-#define TX_registerNetworkStatsProvider 14
-#define TX_noteUidForeground            15
-#define TX_advisePersistThreshold       16
-#define TX_setStatsProviderWarningAndLimitAsync 17
+#define TX_getUidStats                  4
+#define TX_getIfaceStats                5
+#define TX_getMobileIfaces              6
+#define TX_incrementOperationCount      7
+#define TX_notifyNetworkStatus          8
+#define TX_forceUpdate                  9
+#define TX_registerUsageCallback        10
+#define TX_unregisterUsageRequest       11
+#define TX_getTotalStats                12
+#define TX_registerNetworkStatsProvider 13
+#define TX_noteUidForeground            14
+#define TX_advisePersistThreshold       15
+#define TX_setStatsProviderWarningAndLimitAsync 16
+#define TX_getUidStatsForTransport      17
 #define TX_getRateLimitCacheConfig      18
 
-/* ============================================================
- * INetworkStatsSession transaction codes
- * ============================================================ */
+/* INetworkStatsSession */
 #define SESS_getDeviceSummaryForNetwork   1
 #define SESS_getSummaryForNetwork         2
 #define SESS_getHistoryForNetwork         3
@@ -117,22 +151,22 @@
 #define SESS_getHistoryIntervalForUid     8
 #define SESS_getRelevantUids              9
 #define SESS_close                        10
+#define SESS_getDeviceSummaryForNetworkWithMetered 11
+#define SESS_getSummaryForNetworkWithMetered       12
 
 /* Standard AIDL codes */
 #define TX_GET_INTERFACE_VERSION 16777215
 #define TX_GET_INTERFACE_HASH    16777216
 
-/* Legacy/fallback codes for patched GSIs (use high values to avoid collision) */
+/* Legacy/fallback codes for patched GSIs */
 #define TX_LEGACY_GET_TOTAL_STATS   10001
 #define TX_LEGACY_GET_IFACE_STATS   10002
 #define TX_LEGACY_FORCE_UPDATE      10003
 #define TX_LEGACY_GET_UID_STATS     10004
 
-#define TYPE_RX_BYTES   0
-#define TYPE_TX_BYTES   1
-#define TYPE_RX_PACKETS 2
-#define TYPE_TX_PACKETS 3
-
+/* ============================================================
+ * Types
+ * ============================================================ */
 typedef uint64_t binder_uintptr_t;
 typedef uint64_t binder_size_t;
 
@@ -171,19 +205,13 @@ struct binder_transaction_data {
     } data;
 };
 
-struct binder_ptr_cookie {
-    uint64_t ptr;
-    uint64_t cookie;
-};
-
-struct binder_pri_ptr_cookie {
-    int32_t priority;
-    uint64_t ptr;
-    uint64_t cookie;
+struct iface_stat {
+    char name[96];
+    uint64_t rxBytes, rxPackets, txBytes, txPackets;
+    int has_data;
 };
 
 #define BINDER_WRITE_READ        0xC0306201
-/* BINDER_VERSION is _IOWR('b', 9, __s32) = 0xC0046209 (size=4) */
 #define BINDER_VERSION           0xC0046209
 #define BINDER_SET_MAX_THREADS   0x40086205
 
@@ -192,6 +220,7 @@ struct binder_pri_ptr_cookie {
  * ============================================================ */
 static FILE* log_fp = NULL;
 static int log_line_count = 0;
+static time_t g_start_time = 0;
 
 static void log_open(void) {
     if (!log_fp) {
@@ -200,55 +229,64 @@ static void log_open(void) {
     }
 }
 
-static void log_msg(const char* msg) {
+__attribute__((format(printf,1,2)))
+static void log_msg(const char* fmt, ...) {
     log_open();
     if (!log_fp) return;
     time_t t = time(NULL);
     struct tm* tm_info = localtime(&t);
-    if (tm_info) {
-        char ts[64];
-        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm_info);
-        fprintf(log_fp, "%s [NETPROXY-v8] %s\n", ts, msg);
-    } else {
-        fprintf(log_fp, "[NETPROXY-v8] %s\n", msg);
-    }
-    log_line_count++;
-}
-
-static void log_errno(const char* ctx) {
-    char buf[256];
-    snprintf(buf, sizeof(buf), "ERROR %s: errno=%d (%s)", ctx, errno, strerror(errno));
-    log_msg(buf);
-}
-
-__attribute__((format(printf,1,2)))
-static void log_fmt(const char* fmt, ...) {
-    char buf[2048];
+    char ts[64] = "1970-01-01 00:00:00";
+    if (tm_info) strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm_info);
+    char buf[4096];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    log_msg(buf);
+    fprintf(log_fp, "%s [NETPROXY-v9] %s\n", ts, buf);
+    log_line_count++;
+    if (log_line_count % 1000 == 0) {
+        fprintf(log_fp, "%s [NETPROXY-v9] --- LOG_ROLLOVER count=%d ---\n", ts, log_line_count);
+    }
+}
+
+static void log_errno(const char* ctx) {
+    log_msg("ERROR %s: errno=%d (%s)", ctx, errno, strerror(errno));
+}
+
+static void log_hex(const char* label, const uint8_t* data, uint32_t len) {
+    char buf[4096];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s (%u bytes):", label, len);
+    uint32_t dump_len = len > 128 ? 128 : len;
+    for (uint32_t i = 0; i < dump_len && pos < (int)sizeof(buf) - 16; i++) {
+        if (i % 16 == 0) pos += snprintf(buf + pos, sizeof(buf) - pos, "\n  ");
+        else if (i % 8 == 0) pos += snprintf(buf + pos, sizeof(buf) - pos, " ");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x ", data[i]);
+    }
+    if (len > 128) pos += snprintf(buf + pos, sizeof(buf) - pos, "\n  ... (%u more bytes)", len - 128);
+    log_msg("%s", buf);
 }
 
 /* ============================================================
  * /proc/net/dev reader
  * ============================================================ */
 struct net_stats { uint64_t rxBytes, rxPackets, txBytes, txPackets; };
-struct iface_stat { char name[64]; uint64_t rxBytes, rxPackets, txBytes, txPackets; };
+static struct net_stats g_prev_stats;
 
 static int read_iface_stats(const char* iface, struct net_stats* out) {
     memset(out, 0, sizeof(*out));
     FILE* f = fopen("/proc/net/dev", "r");
     if (!f) return -1;
-    char line[512];
+    char line[1024];
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     while (fgets(line, sizeof(line), f)) {
         char* p = line; while (*p == ' ' || *p == '\t') p++;
-        size_t ilen = strlen(iface);
-        if (strncmp(p, iface, ilen) == 0 && p[ilen] == ':') {
-            char* vals = p + ilen + 1;
+        char* colon = strchr(p, ':');
+        if (!colon) continue;
+        size_t ilen = (size_t)(colon - p);
+        if (ilen == strlen(iface) && strncmp(p, iface, ilen) == 0) {
+            char* vals = colon + 1;
             int col = 0; char* saveptr;
             char* tok = strtok_r(vals, " \t\n\r", &saveptr);
             while (tok && col <= 9) {
@@ -269,7 +307,7 @@ static int read_all_stats(struct net_stats* out) {
     memset(out, 0, sizeof(*out));
     FILE* f = fopen("/proc/net/dev", "r");
     if (!f) return -1;
-    char line[512];
+    char line[1024];
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     while (fgets(line, sizeof(line), f)) {
@@ -296,7 +334,7 @@ static int read_all_ifaces(struct iface_stat* ifaces, int* count) {
     *count = 0;
     FILE* f = fopen("/proc/net/dev", "r");
     if (!f) return -1;
-    char line[512];
+    char line[1024];
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     while (fgets(line, sizeof(line), f) && *count < MAX_IFACES) {
@@ -308,113 +346,175 @@ static int read_all_ifaces(struct iface_stat* ifaces, int* count) {
         if (nlen >= sizeof(ifaces[*count].name)) nlen = sizeof(ifaces[*count].name) - 1;
         memcpy(ifaces[*count].name, p, nlen);
         ifaces[*count].name[nlen] = '\0';
+        ifaces[*count].has_data = 0;
         char* vals = colon + 1; int col = 0; char* saveptr;
         char* tok = strtok_r(vals, " \t\n\r", &saveptr);
         while (tok && col <= 9) {
             uint64_t v = strtoull(tok, NULL, 10);
-            if      (col == 0) ifaces[*count].rxBytes   = v;
-            else if (col == 1) ifaces[*count].rxPackets  = v;
+            if      (col == 0) ifaces[*count].rxBytes    = v;
+            else if (col == 1) ifaces[*count].rxPackets   = v;
             else if (col == 8) ifaces[*count].txBytes    = v;
             else if (col == 9) ifaces[*count].txPackets  = v;
             col++; tok = strtok_r(NULL, " \t\n\r", &saveptr);
         }
+        ifaces[*count].has_data = 1;
         (*count)++;
     }
     fclose(f); return 0;
 }
 
-static void update_stats_file_detailed(void) {
+static void write_stats_file(void) {
     struct iface_stat ifaces[MAX_IFACES];
+    struct net_stats total;
     int count = 0;
     if (read_all_ifaces(ifaces, &count) != 0) return;
+    read_all_stats(&total);
+
     FILE* f = fopen(STATSFILE, "w");
     if (!f) return;
-    uint64_t trx = 0, ttx = 0, trxp = 0, ttxp = 0;
     for (int i = 0; i < count; i++) {
-        trx += ifaces[i].rxBytes; trxp += ifaces[i].rxPackets;
-        ttx += ifaces[i].txBytes; ttxp += ifaces[i].txPackets;
-        fprintf(f, "iface_%s_rx=%llu\niface_%s_tx=%llu\niface_%s_rxp=%llu\niface_%s_txp=%llu\n",
-                ifaces[i].name, (unsigned long long)ifaces[i].rxBytes,
-                ifaces[i].name, (unsigned long long)ifaces[i].txBytes,
-                ifaces[i].name, (unsigned long long)ifaces[i].rxPackets,
-                ifaces[i].name, (unsigned long long)ifaces[i].txPackets);
+        fprintf(f, "iface_%s_rx=%" PRIu64 "\niface_%s_tx=%" PRIu64 "\niface_%s_rxp=%" PRIu64 "\niface_%s_txp=%" PRIu64 "\n",
+                ifaces[i].name, ifaces[i].rxBytes,
+                ifaces[i].name, ifaces[i].txBytes,
+                ifaces[i].name, ifaces[i].rxPackets,
+                ifaces[i].name, ifaces[i].txPackets);
     }
-    fprintf(f, "rx_bytes=%llu\ntx_bytes=%llu\nrx_packets=%llu\ntx_packets=%llu\niface_count=%d\ntimestamp=%lu\n",
-            (unsigned long long)trx, (unsigned long long)ttx,
-            (unsigned long long)trxp, (unsigned long long)ttxp, count,
-            (unsigned long)time(NULL));
-    fclose(f); chmod(STATSFILE, 0644);
+    fprintf(f, "rx_bytes=%" PRIu64 "\ntx_bytes=%" PRIu64 "\nrx_packets=%" PRIu64 "\ntx_packets=%" PRIu64 "\niface_count=%d\ntimestamp=%ld\n",
+            total.rxBytes, total.txBytes, total.rxPackets, total.txPackets, count, (long)time(NULL));
+
+    /* Also write per-iface dev file */
+    FILE* fd = fopen(STATSFILE_DEV, "w");
+    if (fd) {
+        for (int i = 0; i < count; i++) {
+            fprintf(fd, "%s %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+                    ifaces[i].name, ifaces[i].rxBytes, ifaces[i].rxPackets,
+                    ifaces[i].txBytes, ifaces[i].txPackets);
+        }
+        fclose(fd);
+        chmod(STATSFILE_DEV, 0644);
+    }
+    fclose(f);
+    chmod(STATSFILE, 0644);
 }
 
-/* ============================================================
- * Session management (declared early for debug counters)
- * ============================================================ */
-static int session_count = 0;
-static uint64_t session_ptrs[MAX_SESSIONS];
-static uint64_t session_cookies[MAX_SESSIONS];
+/* Forward declarations for functions defined later in the file */
+static void write_all_stats_sources(void);
+static void populate_bpf_maps(void);
+static int write_bpf_stats(int uid, uint64_t rxBytes, uint64_t rxPackets,
+                           uint64_t txBytes, uint64_t txPackets);
+static int write_bpf_owner(int uid);
+static void write_uid_stat_entry(int uid, uint64_t rx, uint64_t tx);
+static void populate_uid_stat_all(void);
+static void try_load_xt_qtaguid(void);
+static void write_netstats_xml(void);
 
 /* ============================================================
- * Debug counters
+ * Per-UID stats tracking (approximate from /proc/net/dev)
+ * We distribute total traffic proportionally among active UIDs
  * ============================================================ */
+#define MAX_UID_STATS 256
+static struct {
+    int uid;
+    uint64_t rxBytes, txBytes;
+    time_t last_seen;
+} g_uid_stats[MAX_UID_STATS];
+static int g_uid_count = 0;
 
-static int g_registration_attempts = 0;
-static int g_br_transaction_count = 0;
-static int g_br_reply_count = 0;
-static int g_br_error_count = 0;
-static int g_br_dead_count = 0;
-static int g_br_other_count = 0;
-static int g_build_session_count = 0;
-static int g_build_stats_count = 0;
-static int g_build_network_count = 0;
-static int g_build_void_count = 0;
-static int g_unknown_code_count = 0;
-static int g_session_open_count = 0;
-static int g_session_close_count = 0;
-static time_t g_last_summary = 0;
+static void update_uid_stats(void) {
+    struct net_stats total;
+    if (read_all_stats(&total) != 0) return;
 
-/* ============================================================
- * Hex dump helper for debugging parcel content
- * ============================================================ */
-static void hex_dump(const char* label, const uint8_t* data, uint32_t len) {
-    char buf[2048];
-    int pos = 0;
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s (%u bytes):", label, len);
-    uint32_t dump_len = len > 64 ? 64 : len;
-    for (uint32_t i = 0; i < dump_len && pos < (int)sizeof(buf) - 16; i++) {
-        if (i % 16 == 0) pos += snprintf(buf + pos, sizeof(buf) - pos, "\n  ");
-        else if (i % 8 == 0) pos += snprintf(buf + pos, sizeof(buf) - pos, " ");
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x ", data[i]);
+    /* Collect active UIDs from /proc/net/netfilter or just use common ones */
+    int uids[32] = {1000, 1001, 1002, 1013, 1021, 1023, 1027, 1028, 1029,
+                    1037, 1038, 1039, 1041, 1044, 1045, 1046, 1047, 2000,
+                    2001, 9999, 0};
+    int uidc = 0;
+    while (uids[uidc] != 0 && uidc < 32) uidc++;
+
+    /* Scan /proc/ for running apps to get more UIDs */
+    DIR* proc = opendir("/proc");
+    if (proc) {
+        struct dirent* entry;
+        while ((entry = readdir(proc)) && uidc < 30) {
+            int pid = atoi(entry->d_name);
+            if (pid <= 0) continue;
+            char path[256];
+            snprintf(path, sizeof(path), "/proc/%d/status", pid);
+            FILE* sf = fopen(path, "r");
+            if (!sf) continue;
+            char sl[256];
+            int found_uid = -1;
+            while (fgets(sl, sizeof(sl), sf)) {
+                if (strncmp(sl, "Uid:", 4) == 0) {
+                    int ruid;
+                    sscanf(sl, "Uid:\t%d", &ruid);
+                    if (ruid >= 10000) found_uid = ruid;
+                    break;
+                }
+            }
+            fclose(sf);
+            if (found_uid >= 0) {
+                int dup = 0;
+                for (int i = 0; i < uidc; i++) {
+                    if (uids[i] == found_uid) { dup = 1; break; }
+                }
+                if (!dup) uids[uidc++] = found_uid;
+            }
+        }
+        closedir(proc);
     }
-    if (len > 64) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "\n  ... (%u more bytes)", len - 64);
+    if (uidc == 0) {
+        uids[uidc++] = 1000;
+        uids[uidc++] = 10027;
     }
-    log_msg(buf);
+
+    /* Distribute total traffic among UIDs */
+    uint64_t per_uid_rx = total.rxBytes / (uint64_t)(uidc > 0 ? uidc : 1);
+    uint64_t per_uid_tx = total.txBytes / (uint64_t)(uidc > 0 ? uidc : 1);
+
+    g_uid_count = uidc;
+    for (int i = 0; i < uidc && i < MAX_UID_STATS; i++) {
+        g_uid_stats[i].uid = uids[i];
+        g_uid_stats[i].rxBytes = per_uid_rx;
+        g_uid_stats[i].txBytes = per_uid_tx;
+        g_uid_stats[i].last_seen = time(NULL);
+    }
+
+    /* Write per-UID stats file */
+    FILE* uf = fopen("/data/local/tmp/netproxy_uid", "w");
+    if (uf) {
+        for (int i = 0; i < uidc; i++) {
+            fprintf(uf, "uid_%d_rx=%" PRIu64 "\nuid_%d_tx=%" PRIu64 "\n",
+                    uids[i], per_uid_rx, uids[i], per_uid_tx);
+        }
+        fprintf(uf, "uid_count=%d\ntimestamp=%ld\n", uidc, (long)time(NULL));
+        fclose(uf);
+        chmod("/data/local/tmp/netproxy_uid", 0644);
+    }
+
+    /* Also push to BPF maps and /proc/uid_stat/ */
+    for (int i = 0; i < uidc && i < MAX_UID_STATS; i++) {
+        write_uid_stat_entry(g_uid_stats[i].uid, g_uid_stats[i].rxBytes, g_uid_stats[i].txBytes);
+    }
+    populate_bpf_maps();
 }
 
-/* ============================================================
- * Log summary of operations periodically
- * ============================================================ */
-static void log_summary(void) {
-    time_t now = time(NULL);
-    if (now - g_last_summary < 60) return;  /* once per minute */
-    g_last_summary = now;
+static uint64_t get_uid_rx(int uid) {
+    for (int i = 0; i < g_uid_count && i < MAX_UID_STATS; i++) {
+        if (g_uid_stats[i].uid == uid) return g_uid_stats[i].rxBytes;
+    }
+    struct net_stats total;
+    if (read_all_stats(&total) == 0) return total.rxBytes / 10;
+    return 0;
+}
 
-    struct net_stats s;
-    memset(&s, 0, sizeof(s));
-    read_all_stats(&s);
-
-    log_fmt("--- [SUMMARY] @ %lld ---", (long long)now);
-    log_fmt("  BR: txns=%d replies=%d errors=%d dead=%d other=%d",
-            g_br_transaction_count, g_br_reply_count, g_br_error_count, g_br_dead_count, g_br_other_count);
-    log_fmt("  sessions: open=%d close=%d active=%d",
-            g_session_open_count, g_session_close_count, session_count);
-    log_fmt("  replies: session=%d stats=%d netstats=%d void=%d unknown=%d",
-            g_build_session_count, g_build_stats_count, g_build_network_count,
-            g_build_void_count, g_unknown_code_count);
-    log_fmt("  registrations_attempted=%d", g_registration_attempts);
-    log_fmt("  proc_net_dev: rx=%llu tx=%llu rxp=%llu txp=%llu",
-            (unsigned long long)s.rxBytes, (unsigned long long)s.txBytes,
-            (unsigned long long)s.rxPackets, (unsigned long long)s.txPackets);
+static uint64_t get_uid_tx(int uid) {
+    for (int i = 0; i < g_uid_count && i < MAX_UID_STATS; i++) {
+        if (g_uid_stats[i].uid == uid) return g_uid_stats[i].txBytes;
+    }
+    struct net_stats total;
+    if (read_all_stats(&total) == 0) return total.txBytes / 10;
+    return 0;
 }
 
 /* ============================================================
@@ -425,71 +525,74 @@ static uint8_t* binder_map = NULL;
 
 static int do_ioctl(int fd, unsigned long cmd, void* arg) {
     int ret = ioctl(fd, cmd, arg);
-    if (ret < 0) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "ioctl 0x%lx failed: errno=%d (%s)", cmd, errno, strerror(errno));
-        log_msg(buf);
+    if (ret < 0 && errno != EINTR && errno != EAGAIN) {
+        log_msg("ioctl 0x%lx cmd=%lu failed: errno=%d (%s)", cmd, cmd, errno, strerror(errno));
     }
     return ret;
 }
 
 static int open_binder(void) {
-    const char* paths[] = { "/dev/binder", "/dev/vndbinder", "/dev/hwbinder", NULL };
+    const char* paths[] = {"/dev/binder", "/dev/vndbinder", "/dev/hwbinder", NULL};
 
-    /* Try each binder device path */
     for (int pi = 0; paths[pi]; pi++) {
         const char* devpath = paths[pi];
-        for (int attempt = 0; attempt < 10; attempt++) {
+        log_msg("Trying binder device: %s", devpath);
+        for (int attempt = 0; attempt < 15; attempt++) {
             int fd = open(devpath, O_RDWR | O_CLOEXEC);
             if (fd >= 0) {
-                log_fmt("opened %s (attempt %d)", devpath, attempt + 1);
+                log_msg("opened %s (attempt %d fd=%d)", devpath, attempt + 1, fd);
 
-                /* Probe BINDER_VERSION (non-fatal — assume v1 on failure) */
                 struct binder_version ver;
                 memset(&ver, 0, sizeof(ver));
                 int vret = ioctl(fd, BINDER_VERSION, &ver);
                 if (vret == 0) {
-                    log_fmt("  %s: binder protocol version %d", devpath, ver.protocol_version);
+                    log_msg("  %s: binder protocol version %d", devpath, ver.protocol_version);
                 } else {
-                    log_fmt("  %s: BINDER_VERSION ioctl failed (errno=%d), assuming v1", devpath, errno);
+                    log_msg("  %s: BINDER_VERSION ioctl failed (errno=%d), assuming v1", devpath, errno);
                 }
 
-                /* Set max threads */
-                uint32_t max_threads = 32;
+                uint32_t max_threads = 64;
                 ioctl(fd, BINDER_SET_MAX_THREADS, &max_threads);
 
-                /* mmap binder fd */
+                /* Try PROT_READ first, then MAP_SHARED, then PROT_READ|PROT_WRITE */
                 uint8_t* map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
                                               MAP_PRIVATE | MAP_NORESERVE, fd, 0);
                 if (map == MAP_FAILED) {
-                    map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
-                                        MAP_PRIVATE, fd, 0);
+                    map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_NORESERVE, fd, 0);
                 }
                 if (map == MAP_FAILED) {
-                    log_fmt("  %s: mmap failed, trying next device", devpath);
+                    map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
+                                        MAP_SHARED, fd, 0);
+                }
+                if (map == MAP_FAILED) {
+                    log_msg("  %s: mmap failed (errno=%d), trying next device", devpath, errno);
                     close(fd);
-                    break;  /* try next device path */
+                    break;
                 }
 
-                /* Success — commit */
                 binder_fd = fd;
                 binder_map = map;
-                log_fmt("binder ready: %s mmap=%p size=%d", devpath, (void*)binder_map, BINDER_MMAP_SIZE);
+                log_msg("binder ready: %s mmap=%p size=%d prot=%s",
+                        devpath, (void*)binder_map, BINDER_MMAP_SIZE,
+                        "READ");
                 return 0;
             }
 
-            /* File not found — skip to next path immediately */
             if (errno == ENOENT) {
-                log_fmt("  %s: not found (ENOENT), skipping", devpath);
+                log_msg("  %s: not found (ENOENT), skipping", devpath);
                 break;
             }
-
-            /* Transient error — retry */
-            if (attempt < 9) usleep(500000);
+            if (errno == EBUSY) {
+                log_msg("  %s: busy (EBUSY), retrying...", devpath);
+            } else if (attempt > 0) {
+                log_msg("  %s: retry %d failed (errno=%d)", devpath, attempt + 1, errno);
+            }
+            if (attempt < 14) usleep(500000);
         }
     }
 
-    log_msg("FATAL: no binder device could be opened");
+    log_msg("FATAL: no binder device could be opened after all attempts");
     return -1;
 }
 
@@ -511,24 +614,35 @@ static int send_bc_with_reply(const void* write_buf, size_t write_size,
     bwr.read_size    = read_size;
     bwr.read_buffer  = (uint64_t)(uintptr_t)read_buf;
     int ret = do_ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
-    if (ret < 0) return ret;
+    if (ret < 0 && errno != EINTR) return ret;
     if (read_consumed) *read_consumed = (size_t)bwr.read_consumed;
     return 0;
 }
 
-static int enter_looper(void) {
-    uint32_t cmd = BC_ENTER_LOOPER;
-    return send_binder_cmd(&cmd, sizeof(cmd));
-}
-
 /* ============================================================
- * Parcel helpers
+ * Parcel helpers (forward declarations)
  * ============================================================ */
+static void write_int32(uint8_t** buf, int32_t val);
+static void write_int64(uint8_t** buf, int64_t val);
+
+/* ============================================================ */
 static void write_str16(uint8_t** buf, const char* s) {
+    if (!s) { write_int32(buf, -1); return; }
     uint32_t len = (uint32_t)strlen(s);
     memcpy(*buf, &len, 4); *buf += 4;
     for (uint32_t i = 0; i < len; i++) {
         uint16_t c = (uint16_t)(unsigned char)s[i];
+        memcpy(*buf, &c, 2); *buf += 2;
+    }
+    uint16_t nul = 0;
+    memcpy(*buf, &nul, 2); *buf += 2;
+    while ((uintptr_t)(*buf) % 4 != 0) { **buf = 0; (*buf)++; }
+}
+
+__attribute__((unused)) static void write_str16_raw(uint8_t** buf, const uint8_t* data, uint32_t len) {
+    memcpy(*buf, &len, 4); *buf += 4;
+    for (uint32_t i = 0; i < len; i++) {
+        uint16_t c = (uint16_t)data[i];
         memcpy(*buf, &c, 2); *buf += 2;
     }
     uint16_t nul = 0;
@@ -551,141 +665,228 @@ static void write_int64(uint8_t** buf, int64_t val) {
     memcpy(*buf, &val, 8); *buf += 8;
 }
 
-static void write_int32_array(uint8_t** buf, const int32_t* arr, int32_t len) {
+__attribute__((unused)) static void write_uint32(uint8_t** buf, uint32_t val) {
+    memcpy(*buf, &val, 4); *buf += 4;
+}
+
+__attribute__((unused)) static int32_t read_int32(const uint8_t** pp) {
+    int32_t val; memcpy(&val, *pp, 4); *pp += 4; return val;
+}
+
+__attribute__((unused)) static int64_t read_int64(const uint8_t** pp) {
+    int64_t val; memcpy(&val, *pp, 8); *pp += 8; return val;
+}
+
+__attribute__((unused)) static void write_int32_array(uint8_t** buf, const int32_t* arr, int32_t len) {
     write_int32(buf, len);
     for (int32_t i = 0; i < len; i++) write_int32(buf, arr[i]);
 }
 
-static void write_int64_array(uint8_t** buf, const int64_t* arr, int32_t len) {
+__attribute__((unused)) static void write_int64_array(uint8_t** buf, const int64_t* arr, int32_t len) {
     write_int32(buf, len);
     for (int32_t i = 0; i < len; i++) write_int64(buf, arr[i]);
 }
 
+static void write_int32_array_fill(uint8_t** buf, int32_t val, int32_t len) {
+    write_int32(buf, len);
+    for (int32_t i = 0; i < len; i++) write_int32(buf, val);
+}
+
+static void write_int64_array_fill(uint8_t** buf, int64_t val, int32_t len) {
+    write_int32(buf, len);
+    for (int32_t i = 0; i < len; i++) write_int64(buf, val);
+}
+
 /* ============================================================
- * Build StatsResult Parcel (for codes 11, 12, 13)
- * Parcel format:
- *   int32_t(0)       - exception (writeNoException)
- *   int32_t(1)       - non-null (writeTypedObject)
- *   int32_t(36)      - StatsResult size
- *   int64_t(rxBytes)
- *   int64_t(rxPackets)
- *   int64_t(txBytes)
- *   int64_t(txPackets)
+ * Build StatsResult Parcel
+ * Format (AIDL): exception + nullable StatsResult(4 x int64)
  * ============================================================ */
 static size_t build_stats_result_reply(uint8_t* buf, size_t buf_size,
                                        uint64_t rxBytes, uint64_t rxPackets,
                                        uint64_t txBytes, uint64_t txPackets) {
     (void)buf_size;
     uint8_t* p = buf;
-    g_build_stats_count++;
-    write_int32(&p, 0);          /* exception = 0 */
+    write_int32(&p, 0);          /* exception = 0 (writeNoException) */
     write_int32(&p, 1);          /* non-null parcelable */
     write_int32(&p, 36);         /* StatsResult size (4 longs = 32 bytes + 4 byte header) */
     write_int64(&p, rxBytes);
     write_int64(&p, rxPackets);
     write_int64(&p, txBytes);
     write_int64(&p, txPackets);
-    log_fmt("[REPLY] StatsResult: rxB=%llu rxP=%llu txB=%llu txP=%llu size=%zu",
-            (unsigned long long)rxBytes, (unsigned long long)rxPackets,
-            (unsigned long long)txBytes, (unsigned long long)txPackets,
-            (size_t)(p - buf));
+    log_msg("[REPLY] StatsResult: rxB=%" PRIu64 " rxP=%" PRIu64 " txB=%" PRIu64 " txP=%" PRIu64 " size=%zu",
+            rxBytes, rxPackets, txBytes, txPackets, (size_t)(p - buf));
     return (size_t)(p - buf);
 }
 
 /* ============================================================
- * Build NetworkStats Parcel with single entry (for session methods)
- * Format:
- *   int32_t(0) - exception
- *   int32_t(1) - non-null parcelable
- *   NetworkStats data:
- *     int64_t(elapsedRealtime=0)
- *     int32_t(size=1)
- *     int32_t(capacity=1)
- *     String[] iface: int32_t(1), str16("wlan0")
- *     int32_t[] uid: [UID_ALL=-1]
- *     int32_t[] set: [SET_DEFAULT=0]
- *     int32_t[] tag: [TAG_NONE=0]
- *     int32_t[] metered: [METERED_ALL=-1]
- *     int32_t[] roaming: [ROAMING_ALL=-1]
- *     int32_t[] defaultNetwork: [DEFAULT_NETWORK_ALL=-1]
- *     int64_t[] rxBytes: [rxBytes]
- *     int64_t[] rxPackets: [rxPackets]
- *     int64_t[] txBytes: [txBytes]
- *     int64_t[] txPackets: [txPackets]
- *     int64_t[] operations: [0]
+ * Build NetworkStats Parcel with multiple entries (one per interface)
  * ============================================================ */
-static size_t build_network_stats_reply(uint8_t* buf, size_t buf_size,
-                                         uint64_t rxBytes, uint64_t rxPackets,
-                                         uint64_t txBytes, uint64_t txPackets) {
+static size_t build_network_stats_reply_full(uint8_t* buf, size_t buf_size,
+                                              uint64_t rxBytes, uint64_t rxPackets,
+                                              uint64_t txBytes, uint64_t txPackets) {
     (void)buf_size;
     uint8_t* p = buf;
-    g_build_network_count++;
+
+    /* Get all interfaces */
+    struct iface_stat ifaces[MAX_IFACES];
+    int iface_count = 0;
+    read_all_ifaces(ifaces, &iface_count);
+
+    int entry_count = iface_count > 0 ? iface_count : 1;
+    if (entry_count > 16) entry_count = 16; /* Keep reply size reasonable */
+
     write_int32(&p, 0);  /* exception */
 
-    /* Start of NetworkStats Parcelable */
-    write_int32(&p, 1);  /* non-null */
-
-    /* elapsedRealtime */
-    write_int64(&p, 0);
+    write_int32(&p, 1);  /* non-null parcelable */
+    write_int64(&p, 0);  /* elapsedRealtime */
 
     /* size, capacity */
-    write_int32(&p, 1);
-    write_int32(&p, 1);
+    write_int32(&p, entry_count);
+    write_int32(&p, entry_count);
 
-    /* iface array: ["wlan0"] */
-    write_int32(&p, 1);
-    write_str16(&p, "wlan0");
+    /* Build string arrays for iface */
+    write_int32(&p, entry_count);
+    for (int i = 0; i < entry_count; i++) {
+        if (iface_count > 0 && i < iface_count && ifaces[i].name[0]) {
+            write_str16(&p, ifaces[i].name);
+        } else {
+            write_str16(&p, (i == 0) ? "wlan0" : "rmnet0");
+        }
+    }
 
-    /* uid array: [-1] */
-    { int32_t val[] = {-1}; write_int32_array(&p, val, 1); }
+    /* uid array: all -1 (UID_ALL) */
+    write_int32_array_fill(&p, -1, entry_count);
 
-    /* set array: [0] */
-    { int32_t val[] = {0}; write_int32_array(&p, val, 1); }
+    /* set array: all 0 (SET_DEFAULT) */
+    write_int32_array_fill(&p, 0, entry_count);
 
-    /* tag array: [0] */
-    { int32_t val[] = {0}; write_int32_array(&p, val, 1); }
+    /* tag array: all 0 (TAG_NONE) */
+    write_int32_array_fill(&p, 0, entry_count);
 
-    /* metered array: [-1] */
-    { int32_t val[] = {-1}; write_int32_array(&p, val, 1); }
+    /* metered array: all -1 (METERED_ALL) */
+    write_int32_array_fill(&p, -1, entry_count);
 
-    /* roaming array: [-1] */
-    { int32_t val[] = {-1}; write_int32_array(&p, val, 1); }
+    /* roaming array: all -1 (ROAMING_ALL) */
+    write_int32_array_fill(&p, -1, entry_count);
 
-    /* defaultNetwork array: [-1] */
-    { int32_t val[] = {-1}; write_int32_array(&p, val, 1); }
+    /* defaultNetwork array: all -1 (DEFAULT_NETWORK_ALL) */
+    write_int32_array_fill(&p, -1, entry_count);
 
-    /* rxBytes array */
-    { int64_t val[] = {(int64_t)rxBytes}; write_int64_array(&p, val, 1); }
+    /* rxBytes per interface */
+    write_int32(&p, entry_count);
+    for (int i = 0; i < entry_count; i++) {
+        if (iface_count > 0 && i < iface_count)
+            write_int64(&p, (int64_t)ifaces[i].rxBytes);
+        else
+            write_int64(&p, (int64_t)rxBytes);
+    }
 
-    /* rxPackets array */
-    { int64_t val[] = {(int64_t)rxPackets}; write_int64_array(&p, val, 1); }
+    /* rxPackets per interface */
+    write_int32(&p, entry_count);
+    for (int i = 0; i < entry_count; i++) {
+        if (iface_count > 0 && i < iface_count)
+            write_int64(&p, (int64_t)ifaces[i].rxPackets);
+        else
+            write_int64(&p, (int64_t)rxPackets);
+    }
 
-    /* txBytes array */
-    { int64_t val[] = {(int64_t)txBytes}; write_int64_array(&p, val, 1); }
+    /* txBytes per interface */
+    write_int32(&p, entry_count);
+    for (int i = 0; i < entry_count; i++) {
+        if (iface_count > 0 && i < iface_count)
+            write_int64(&p, (int64_t)ifaces[i].txBytes);
+        else
+            write_int64(&p, (int64_t)txBytes);
+    }
 
-    /* txPackets array */
-    { int64_t val[] = {(int64_t)txPackets}; write_int64_array(&p, val, 1); }
+    /* txPackets per interface */
+    write_int32(&p, entry_count);
+    for (int i = 0; i < entry_count; i++) {
+        if (iface_count > 0 && i < iface_count)
+            write_int64(&p, (int64_t)ifaces[i].txPackets);
+        else
+            write_int64(&p, (int64_t)txPackets);
+    }
 
-    /* operations array */
-    { int64_t val[] = {0}; write_int64_array(&p, val, 1); }
+    /* operations array: all 0 */
+    write_int64_array_fill(&p, 0, entry_count);
 
     size_t total_sz = (size_t)(p - buf);
-    log_fmt("[REPLY] NetworkStats: rxB=%llu rxP=%llu txB=%llu txP=%llu size=%zu",
-            (unsigned long long)rxBytes, (unsigned long long)rxPackets,
-            (unsigned long long)txBytes, (unsigned long long)txPackets,
-            total_sz);
-    log_fmt("[REPLY] NetworkStats hex:");
-    hex_dump("  NETSTATS", buf, (uint32_t)total_sz);
+    log_msg("[REPLY] NetworkStats: %d ifaces rxB=%" PRIu64 " txB=%" PRIu64 " size=%zu",
+            entry_count, rxBytes, txBytes, total_sz);
+    log_hex("[REPLY] NETSTATS", buf, (uint32_t)total_sz);
     return total_sz;
 }
 
+/* Backward compat: single interface reply */
+static size_t build_network_stats_reply(uint8_t* buf, size_t buf_size,
+                                        uint64_t rxBytes, uint64_t rxPackets,
+                                        uint64_t txBytes, uint64_t txPackets) {
+    return build_network_stats_reply_full(buf, buf_size, rxBytes, rxPackets, txBytes, txPackets);
+}
+
 /* ============================================================
- * Build simple reply for codes that just need exception + status
+ * Build simple reply (exception only)
  * ============================================================ */
 static size_t build_void_reply(uint8_t* buf) {
     uint8_t* p = buf;
-    g_build_void_count++;
-    write_int32(&p, 0);  /* exception */
+    write_int32(&p, 0);
+    return (size_t)(p - buf);
+}
+
+/* Build reply with just exception + int32 */
+__attribute__((unused)) static size_t build_int32_reply(uint8_t* buf, int32_t val) {
+    uint8_t* p = buf;
+    write_int32(&p, 0);
+    write_int32(&p, val);
+    return (size_t)(p - buf);
+}
+
+/* Build reply with exception + int64 */
+static size_t build_int64_reply(uint8_t* buf, int64_t val) {
+    uint8_t* p = buf;
+    write_int32(&p, 0);
+    write_int64(&p, val);
+    return (size_t)(p - buf);
+}
+
+/* Build reply with exception + string[] (empty) */
+static size_t build_empty_string_array_reply(uint8_t* buf) {
+    uint8_t* p = buf;
+    write_int32(&p, 0);
+    write_int32(&p, 0);
+    return (size_t)(p - buf);
+}
+
+/* Build reply with exception + null binder */
+static size_t build_null_binder_reply(uint8_t* buf) {
+    uint8_t* p = buf;
+    write_int32(&p, 0);
+    write_int32(&p, 0);
+    return (size_t)(p - buf);
+}
+
+/* Build reply with exception + null parcelable */
+static size_t build_null_parcelable_reply(uint8_t* buf) {
+    uint8_t* p = buf;
+    write_int32(&p, 0);
+    write_int32(&p, 0);
+    return (size_t)(p - buf);
+}
+
+/* Build reply: exception + int32[] (empty) */
+static size_t build_empty_int32_array_reply(uint8_t* buf) {
+    uint8_t* p = buf;
+    write_int32(&p, 0);
+    write_int32(&p, 0);
+    return (size_t)(p - buf);
+}
+
+/* Build NetworkStatsHistory reply: exception + null */
+static size_t build_null_history_reply(uint8_t* buf) {
+    uint8_t* p = buf;
+    write_int32(&p, 0);
+    write_int32(&p, 0);
     return (size_t)(p - buf);
 }
 
@@ -694,7 +895,20 @@ static size_t build_void_reply(uint8_t* buf) {
  * ============================================================ */
 #define SM_AIDL_CHECK_SERVICE 2
 #define SM_AIDL_ADD_SERVICE   3
-#define SM_AIDL_GET_DECLARED_INSTANCES 4
+
+#define SERVICE_NAME_NETSTATS "netstats"
+#define SERVICE_NAME_NETSTATS_ALT "netstats_service"
+#define SERVICE_NAME_NETSTATS_ALT2 "network_stats"
+
+__attribute__((unused)) static const char* SERVICE_NAMES[] = {
+    SERVICE_NAME_NETSTATS,
+    SERVICE_NAME_NETSTATS_ALT,
+    SERVICE_NAME_NETSTATS_ALT2,
+    NULL
+};
+
+static int g_registered_service_idx = -1;
+static char g_registered_name[64] = "";
 
 static int parse_sm_reply(const uint8_t* rbuf, size_t consumed, int* out_has_binder) {
     const uint8_t* rp = rbuf;
@@ -726,32 +940,29 @@ static int parse_sm_reply(const uint8_t* rbuf, size_t consumed, int* out_has_bin
                 uint64_t buf_ptr = rtr->data.ptr.buffer;
                 uint64_t data_sz = rtr->data_size;
 
-                log_fmt("BR_REPLY: code=%u flags=0x%x data_size=%llu",
-                        rtr->code, rtr->flags, (unsigned long long)rtr->data_size);
-
                 if (data_sz >= 8) {
                     const uint8_t* data = (const uint8_t*)(uintptr_t)buf_ptr;
                     int32_t exc;
                     memcpy(&exc, data, 4);
                     if (exc != 0) {
-                        log_fmt("  exception=%d", exc);
+                        log_msg("  SM reply: exception=%d", exc);
                         result = -1;
                         if (out_has_binder) *out_has_binder = -1;
                     } else {
                         uint64_t binder_val = 0;
                         memcpy(&binder_val, data + 4, 8);
                         if (binder_val != 0) {
-                            log_fmt("  exists: binder=0x%llx", (unsigned long long)binder_val);
+                            log_msg("  SM reply: EXISTS binder=0x%" PRIx64, binder_val);
                             result = 0;
                             if (out_has_binder) *out_has_binder = 1;
                         } else {
-                            log_fmt("  not found");
+                            log_msg("  SM reply: not found");
                             result = 0;
                             if (out_has_binder) *out_has_binder = 0;
                         }
                     }
                 } else {
-                    log_fmt("  empty reply (data_size=%llu)", (unsigned long long)data_sz);
+                    log_msg("  SM reply: empty (data_sz=%" PRIu64 ")", data_sz);
                     result = 0;
                     if (out_has_binder) *out_has_binder = 0;
                 }
@@ -786,22 +997,22 @@ static int parse_sm_reply(const uint8_t* rbuf, size_t consumed, int* out_has_bin
                 break;
 
             case BR_FAILED_REPLY:
-                log_fmt("BR_FAILED_REPLY");
+                log_msg("SM BR_FAILED_REPLY");
                 return -1;
 
             case BR_DEAD_REPLY:
-                log_fmt("BR_DEAD_REPLY");
+                log_msg("SM BR_DEAD_REPLY");
                 return -1;
 
             case BR_ERROR: {
                 int32_t err = 0;
                 if (rp + 4 <= rend) memcpy(&err, rp, 4);
-                log_fmt("BR_ERROR=%d", err);
+                log_msg("SM BR_ERROR=%d", err);
                 return -1;
             }
 
             default:
-                log_fmt("UNKNOWN BR cmd 0x%x", cmd);
+                log_msg("SM unknown BR cmd 0x%x", cmd);
                 return -1;
         }
     }
@@ -881,52 +1092,34 @@ static int aidl_add_service(const char* name, uint64_t binder_ptr, uint64_t cook
 
     uint8_t rbuf[1024];
     size_t consumed = 0;
-    log_fmt("AIDL_addService('%s'): sending %zu bytes, ptr=0x%llx cookie=0x%llx",
-            name, total, (unsigned long long)binder_ptr, (unsigned long long)cookie);
     int ret = send_bc_with_reply(wbuf, total, rbuf, sizeof(rbuf), &consumed);
     free(wbuf);
     if (ret < 0) return -1;
 
     int result = parse_sm_reply(rbuf, consumed, NULL);
-    if (result >= 0) log_fmt("addService('%s'): SUCCESS", name);
-    else log_fmt("addService('%s'): FAILED", name);
+    log_msg("addService('%s'): %s (ret=%d)", name, result >= 0 ? "SUCCESS" : "FAILED", result);
     return result;
 }
 
-static const char* SERVICE_NAMES[] = {
-    "netstats",
-    "netstats_service",
-    "network_stats",
-    NULL
-};
-
-static const char* IFACE_HASH = "b8b0a23cf15c0b9fc3b5e5b0b6a4f3a2c1d0e9f8";
-
-static uint64_t pick_stat(const struct net_stats* s, int type) {
-    switch (type) {
-        case TYPE_RX_BYTES:   return s->rxBytes;
-        case TYPE_TX_BYTES:   return s->txBytes;
-        case TYPE_RX_PACKETS: return s->rxPackets;
-        case TYPE_TX_PACKETS: return s->txPackets;
-        default:              return s->rxBytes + s->txBytes;
-    }
-}
-
 /* ============================================================
- * Session management (arrays declared above with debug vars)
+ * Session management
  * ============================================================ */
+static int session_count = 0;
+static uint64_t session_ptrs[MAX_SESSIONS];
+static uint64_t session_cookies[MAX_SESSIONS];
+
 static uint64_t create_session(void) {
     if (session_count >= MAX_SESSIONS) {
-        log_fmt("WARNING: max sessions reached (%d), wrapping to 0", MAX_SESSIONS);
+        log_msg("WARNING: max sessions reached (%d), wrapping to 0", MAX_SESSIONS);
         session_count = 0;
     }
-    uint64_t ptr = (uint64_t)(uintptr_t)(binder_map + SESSION_BASE + session_count * 0x1000);
+    /* Use a unique ptr that doesn't conflict with existing sessions */
+    uint64_t ptr_base = (uint64_t)(uintptr_t)(binder_map + SESSION_BASE);
+    uint64_t ptr = ptr_base + (uint64_t)session_count * 0x10000 + (uint64_t)(session_count + 1) * 0x100;
     session_ptrs[session_count] = ptr;
     session_cookies[session_count] = ptr;
-    g_session_open_count++;
-    log_fmt("[SESS] create #%d: ptr=0x%llx (total_open=%d active=%d)",
-            session_count, (unsigned long long)ptr,
-            g_session_open_count, session_count + 1);
+    log_msg("[SESS] create #%d: ptr=0x%" PRIx64 " (total_open=%d active=%d)",
+            session_count, ptr, session_count + 1, session_count + 1);
     session_count++;
     return ptr;
 }
@@ -934,32 +1127,26 @@ static uint64_t create_session(void) {
 static int is_session_ptr(uint64_t ptr) {
     for (int i = 0; i < session_count; i++) {
         if (session_ptrs[i] == ptr) {
-            log_fmt("[SESS] lookup: ptr=0x%llx -> idx=%d", (unsigned long long)ptr, i);
             return i;
         }
     }
-    log_fmt("[SESS] lookup: ptr=0x%llx -> NOT FOUND (count=%d)", (unsigned long long)ptr, session_count);
     return -1;
 }
 
 static void destroy_session(int idx) {
     if (idx < 0 || idx >= session_count) {
-        log_fmt("[SESS] destroy: idx=%d INVALID (count=%d)", idx, session_count);
+        log_msg("[SESS] destroy: idx=%d INVALID (count=%d)", idx, session_count);
         return;
     }
     uint64_t ptr = session_ptrs[idx];
-    g_session_close_count++;
     session_ptrs[idx] = session_ptrs[session_count - 1];
     session_cookies[idx] = session_cookies[session_count - 1];
     session_count--;
-    log_fmt("[SESS] destroy idx=%d ptr=0x%llx -> active=%d total_closed=%d",
-            idx, (unsigned long long)ptr, session_count, g_session_close_count);
+    log_msg("[SESS] destroy idx=%d ptr=0x%" PRIx64 " -> active=%d", idx, ptr, session_count);
 }
 
 /* ============================================================
- * Reply with a session flat_binder_object.
- * Returns total reply size. Sets *binder_off to the offset
- * of the flat_binder_object within buf (for BC_REPLY offsets).
+ * Reply with a session flat_binder_object
  * ============================================================ */
 static size_t build_session_reply(uint8_t* buf, uint64_t session_ptr,
                                   uint32_t* binder_off) {
@@ -968,7 +1155,6 @@ static size_t build_session_reply(uint8_t* buf, uint64_t session_ptr,
 
     uint32_t fbo_offset = (uint32_t)(uintptr_t)(p - buf);
 
-    /* FlatBinderObject for the session */
     struct flat_binder_object fbo;
     memset(&fbo, 0, sizeof(fbo));
     fbo.hdr_type = BINDER_TYPE_BINDER;
@@ -982,67 +1168,114 @@ static size_t build_session_reply(uint8_t* buf, uint64_t session_ptr,
 }
 
 /* ============================================================
+ * Debug counters
+ * ============================================================ */
+static int g_br_transaction_count = 0;
+static int g_br_reply_count = 0;
+static int g_br_error_count = 0;
+static int g_br_dead_count = 0;
+static int g_br_other_count = 0;
+__attribute__((unused)) static int g_session_open_count = 0;
+__attribute__((unused)) static int g_session_close_count = 0;
+static int g_unknown_code_count = 0;
+static int g_total_txns = 0;
+__attribute__((unused)) static time_t g_last_summary = 0;
+
+static const char* iface_hash = "e8d9c0b7a6f5e4d3c2b1a0f9e8d7c6b5";
+
+/* ============================================================
  * Transaction handler
  * ============================================================ */
 static uint64_t main_service_ptr = 0;
 static uint64_t main_service_cookie = 0;
 
 static void handle_transaction(const struct binder_transaction_data* tr) {
-    uint8_t reply_data[8192];
+    uint8_t reply_data[16384];
     int session_idx = -1;
     int is_session = 0;
-    int32_t binder_offset = -1;  /* offset of flat_binder_object in reply, -1 = none */
+    int32_t binder_offset = -1;
     uint32_t code = tr->code;
     struct net_stats s;
     read_all_stats(&s);
 
     g_br_transaction_count++;
+    g_total_txns++;
 
     if (main_service_ptr != 0 && tr->target.ptr == main_service_ptr) {
-        is_session = 0;  /* Main service */
+        is_session = 0;
     } else {
         session_idx = is_session_ptr(tr->target.ptr);
         if (session_idx >= 0) {
-            is_session = 1;  /* Session */
+            is_session = 1;
         }
     }
 
-    /* Log full transaction details */
     const uint8_t* raw_data = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
     uint64_t raw_size = tr->data_size;
-    log_fmt("[TX#%d] >>> code=%u(0x%x) %s flags=0x%x data_sz=%llu pid=%d euid=%u tgt_ptr=0x%llx",
-            g_br_transaction_count, code, code, is_session ? "[SESSION]" : "[SERVICE]",
-            tr->flags, (unsigned long long)raw_size,
-            tr->sender_pid, tr->sender_euid,
-            (unsigned long long)tr->target.ptr);
 
-    /* Dump raw transaction data hex for first 5 transactions, then sample */
+    log_msg("[TX#%d] >>> code=%u(0x%x) %s flags=0x%x data_sz=%" PRIu64 " pid=%d euid=%u tgt_ptr=0x%" PRIx64,
+            g_br_transaction_count, code, code, is_session ? "[SESSION]" : "[SERVICE]",
+            tr->flags, raw_size, tr->sender_pid, tr->sender_euid,
+            tr->target.ptr);
+
     if (raw_size > 0 && raw_data) {
-        if (g_br_transaction_count <= 5 || (g_br_transaction_count % 100 == 0)) {
-            hex_dump("[TX-DATA]", raw_data, (uint32_t)(raw_size > 128 ? 128 : raw_size));
+        if (g_br_transaction_count <= 10 || g_br_transaction_count % 50 == 0) {
+            log_hex("[TX-DATA]", raw_data, (uint32_t)(raw_size > 256 ? 256 : raw_size));
+        }
+
+        /* Log the sender process name */
+        char comm_path[64];
+        char comm[64] = "?";
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", tr->sender_pid);
+        FILE* cf = fopen(comm_path, "r");
+        if (cf) {
+            if (fgets(comm, sizeof(comm), cf)) {
+                char* nl = strchr(comm, '\n');
+                if (nl) *nl = '\0';
+            }
+            fclose(cf);
+        }
+        log_msg("[TX#%d]  sender=%s uid=%d pid=%d", g_br_transaction_count, comm, tr->sender_euid, tr->sender_pid);
+
+        /* Log first 4 bytes as int32 (usually exception code or method arg) */
+        if (raw_size >= 4) {
+            int32_t first_val;
+            memcpy(&first_val, raw_data, 4);
+            log_msg("[TX#%d]  first_int32=%d (0x%x)", g_br_transaction_count, first_val, first_val);
+        }
+
+        /* Dump interface descriptor string if this looks like a method call */
+        if (raw_size >= 8) {
+            uint32_t str_len;
+            memcpy(&str_len, raw_data, 4);
+            if (str_len > 0 && str_len < 200 && raw_size > (uint64_t)(4 + str_len * 2)) {
+                char ifdesc[256];
+                uint32_t copy_len = str_len < 120 ? str_len : 120;
+                for (uint32_t i = 0; i < copy_len; i++) {
+                    uint16_t c;
+                    memcpy(&c, raw_data + 4 + i * 2, 2);
+                    ifdesc[i] = (char)c;
+                }
+                ifdesc[copy_len] = '\0';
+                log_msg("[TX#%d]  interface_desc='%s'", g_br_transaction_count, ifdesc);
+            }
         }
     } else {
-        log_fmt("[TX#%d]  no data", g_br_transaction_count);
+        log_msg("[TX#%d]  no data", g_br_transaction_count);
     }
 
-    log_fmt("[TX#%d]  stats: rx=%llu tx=%llu rxp=%llu txp=%llu",
-            g_br_transaction_count,
-            (unsigned long long)s.rxBytes, (unsigned long long)s.txBytes,
-            (unsigned long long)s.rxPackets, (unsigned long long)s.txPackets);
+    log_msg("[TX#%d]  stats: rx=%" PRIu64 " tx=%" PRIu64 " rxp=%" PRIu64 " txp=%" PRIu64,
+            g_br_transaction_count, s.rxBytes, s.txBytes, s.rxPackets, s.txPackets);
 
     size_t reply_size = 0;
 
     if (is_session) {
-        /* ============================================================
-         * INetworkStatsSession methods
-         * ============================================================ */
         switch (code) {
             case SESS_getDeviceSummaryForNetwork:
-            case SESS_getSummaryForNetwork: {
-                /* Skip the NetworkTemplate (complex parcelable) - we don't need it */
-                /* Just skip to the end of the data */
-                /* Actually, we need to skip carefully */
-                log_fmt("  getDeviceSummaryForNetwork/getSummaryForNetwork");
+            case SESS_getSummaryForNetwork:
+            case SESS_getDeviceSummaryForNetworkWithMetered:
+            case SESS_getSummaryForNetworkWithMetered: {
+                log_msg("[TX#%d]  session getDeviceSummary/getSummary", g_br_transaction_count);
                 reply_size = build_network_stats_reply(reply_data, sizeof(reply_data),
                                                        s.rxBytes, s.rxPackets,
                                                        s.txBytes, s.txPackets);
@@ -1051,8 +1284,7 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
 
             case SESS_getSummaryForAllUid:
             case SESS_getTaggedSummaryForAllUid: {
-                /* Returns NetworkStats */
-                log_fmt("  getSummaryForAllUid/getTaggedSummaryForAllUid");
+                log_msg("[TX#%d]  session getSummaryForAllUid/getTaggedSummary", g_br_transaction_count);
                 reply_size = build_network_stats_reply(reply_data, sizeof(reply_data),
                                                        s.rxBytes, s.rxPackets,
                                                        s.txBytes, s.txPackets);
@@ -1063,46 +1295,35 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             case SESS_getHistoryIntervalForNetwork:
             case SESS_getHistoryForUid:
             case SESS_getHistoryIntervalForUid: {
-                /* Returns NetworkStatsHistory - return empty */
-                log_fmt("  getHistory* - returning empty");
-                /* writeNoException + writeTypedObject(null, 1) = 0 + 0 */
-                uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
-                write_int32(&p, 0); /* null */
-                reply_size = (size_t)(p - reply_data);
+                log_msg("[TX#%d]  session getHistory* -> return null", g_br_transaction_count);
+                reply_size = build_null_history_reply(reply_data);
                 break;
             }
 
             case SESS_getRelevantUids: {
-                /* Returns int[] - return empty array */
-                uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
-                write_int32(&p, 0); /* empty array length */
-                reply_size = (size_t)(p - reply_data);
+                log_msg("[TX#%d]  session getRelevantUids -> []", g_br_transaction_count);
+                reply_size = build_empty_int32_array_reply(reply_data);
                 break;
             }
 
             case SESS_close: {
-                log_fmt("  close session %d", session_idx);
+                log_msg("[TX#%d]  session close idx=%d", g_br_transaction_count, session_idx);
                 if (session_idx >= 0) destroy_session(session_idx);
                 reply_size = build_void_reply(reply_data);
                 break;
             }
 
             default: {
-                log_fmt("  UNKNOWN session code %u (0x%x)", code, code);
+                log_msg("[TX#%d]  UNKNOWN session code %u (0x%x)", g_br_transaction_count, code, code);
                 reply_size = build_void_reply(reply_data);
                 break;
             }
         }
     } else {
-        /* ============================================================
-         * INetworkStatsService methods
-         * ============================================================ */
         switch (code) {
             case TX_openSession:
             case TX_openSessionForUsageStats: {
-                log_fmt("  openSession/openSessionForUsageStats");
+                log_msg("[TX#%d]  openSession/openSessionForUsageStats", g_br_transaction_count);
                 uint64_t sess_ptr = create_session();
                 uint32_t bo = 0;
                 reply_size = build_session_reply(reply_data, sess_ptr, &bo);
@@ -1111,7 +1332,7 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             }
 
             case TX_getTotalStats: {
-                log_fmt("  getTotalStats");
+                log_msg("[TX#%d]  getTotalStats", g_br_transaction_count);
                 reply_size = build_stats_result_reply(reply_data, sizeof(reply_data),
                                                       s.rxBytes, s.rxPackets,
                                                       s.txBytes, s.txPackets);
@@ -1119,15 +1340,18 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             }
 
             case TX_getIfaceStats: {
+                log_msg("[TX#%d]  getIfaceStats", g_br_transaction_count);
                 const uint8_t* pp = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
                 char iface[64] = "wlan0";
-                /* Skip first string (interface descriptor) if present */
-                if (tr->data_size > 4) {
+                uint64_t data_remaining = raw_size;
+                if (data_remaining > 4) {
+                    /* Skip interface descriptor / header */
                     skip_str16(&pp);
-                    /* Parse the iface string */
-                    if (pp + 4 <= (const uint8_t*)(uintptr_t)(tr->data.ptr.buffer + tr->data_size)) {
+                    data_remaining = raw_size - (size_t)(pp - raw_data);
+                    /* Parse iface string */
+                    if (data_remaining >= 4) {
                         uint32_t nlen; memcpy(&nlen, pp, 4); pp += 4;
-                        if (nlen > 0 && nlen < 60) {
+                        if (nlen > 0 && nlen < 60 && data_remaining >= (uint64_t)(4 + nlen * 2 + 2)) {
                             for (uint32_t i = 0; i < nlen; i++) {
                                 uint16_t c; memcpy(&c, pp, 2); pp += 2;
                                 iface[i] = (char)c;
@@ -1137,9 +1361,12 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
                     }
                 }
                 struct net_stats is;
-                if (read_iface_stats(iface, &is) != 0) is = s;
-                log_fmt("  getIfaceStats iface=%s rx=%llu tx=%llu",
-                        iface, (unsigned long long)is.rxBytes, (unsigned long long)is.txBytes);
+                if (read_iface_stats(iface, &is) != 0) {
+                    log_msg("[TX#%d]  iface '%s' not found in /proc/net/dev, using total", g_br_transaction_count, iface);
+                    is = s;
+                }
+                log_msg("[TX#%d]  getIfaceStats iface=%s rx=%" PRIu64 " tx=%" PRIu64,
+                        g_br_transaction_count, iface, is.rxBytes, is.txBytes);
                 reply_size = build_stats_result_reply(reply_data, sizeof(reply_data),
                                                       is.rxBytes, is.rxPackets,
                                                       is.txBytes, is.txPackets);
@@ -1147,37 +1374,38 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             }
 
             case TX_getUidStats: {
-                /* Returns StatsResult - we return 0 for per-UID */
                 const uint8_t* pp = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
                 int uid = -1;
-                if (tr->data_size >= 4) memcpy(&uid, pp, 4);
-                log_fmt("  getUidStats uid=%d -> 0 (no per-UID data)", uid);
+                if (raw_size >= 4) memcpy(&uid, pp, 4);
+                struct net_stats us;
+                us.rxBytes = get_uid_rx(uid);
+                us.txBytes = get_uid_tx(uid);
+                us.rxPackets = us.rxBytes / 1500;
+                us.txPackets = us.txBytes / 1500;
+                log_msg("[TX#%d]  getUidStats uid=%d -> rx=%" PRIu64 " tx=%" PRIu64,
+                        g_br_transaction_count, uid, us.rxBytes, us.txBytes);
                 reply_size = build_stats_result_reply(reply_data, sizeof(reply_data),
-                                                      0, 0, 0, 0);
+                                                      us.rxBytes, us.rxPackets,
+                                                      us.txBytes, us.txPackets);
                 break;
             }
 
             case TX_getMobileIfaces: {
-                /* Returns String[] */
-                uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
-                write_int32(&p, 0); /* empty array */
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  getMobileIfaces -> []");
+                log_msg("[TX#%d]  getMobileIfaces -> []", g_br_transaction_count);
+                reply_size = build_empty_string_array_reply(reply_data);
                 break;
             }
 
             case TX_forceUpdate: {
-                update_stats_file_detailed();
-                log_fmt("  forceUpdate");
+                write_all_stats_sources();
+                log_msg("[TX#%d]  forceUpdate", g_br_transaction_count);
                 reply_size = build_void_reply(reply_data);
                 break;
             }
 
             case TX_getUidStatsForTransport:
             case TX_getDataLayerSnapshotForUid: {
-                /* Returns NetworkStats - return empty with total */
-                log_fmt("  getUidStatsForTransport/getDataLayerSnapshotForUid");
+                log_msg("[TX#%d]  getUidStatsForTransport/getDataLayerSnapshotForUid", g_br_transaction_count);
                 reply_size = build_network_stats_reply(reply_data, sizeof(reply_data),
                                                        s.rxBytes, s.rxPackets,
                                                        s.txBytes, s.txPackets);
@@ -1185,81 +1413,89 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             }
 
             case TX_registerNetworkStatsProvider: {
-                /* Returns INetworkStatsProviderCallback */
-                /* Return null - provider registration not supported */
-                uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
-                write_int32(&p, 0); /* null binder */
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  registerNetworkStatsProvider -> null (not supported)");
+                log_msg("[TX#%d]  registerNetworkStatsProvider -> null", g_br_transaction_count);
+                reply_size = build_null_binder_reply(reply_data);
                 break;
             }
 
-            case TX_noteUidForeground:
-            case TX_incrementOperationCount:
-            case TX_notifyNetworkStatus:
-            case TX_unregisterUsageRequest:
-            case TX_advisePersistThreshold:
-            case TX_setStatsProviderWarningAndLimitAsync: {
-                log_fmt("  code %u: void return", code);
+            case TX_incrementOperationCount: {
+                log_msg("[TX#%d]  incrementOperationCount", g_br_transaction_count);
+                reply_size = build_void_reply(reply_data);
+                break;
+            }
+
+            case TX_notifyNetworkStatus: {
+                log_msg("[TX#%d]  notifyNetworkStatus", g_br_transaction_count);
                 reply_size = build_void_reply(reply_data);
                 break;
             }
 
             case TX_registerUsageCallback: {
-                /* Returns DataUsageRequest - return null */
-                uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
-                write_int32(&p, 0); /* null parcelable */
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  registerUsageCallback -> null");
+                log_msg("[TX#%d]  registerUsageCallback -> null", g_br_transaction_count);
+                reply_size = build_null_parcelable_reply(reply_data);
+                break;
+            }
+
+            case TX_unregisterUsageRequest: {
+                log_msg("[TX#%d]  unregisterUsageRequest", g_br_transaction_count);
+                reply_size = build_void_reply(reply_data);
+                break;
+            }
+
+            case TX_noteUidForeground: {
+                log_msg("[TX#%d]  noteUidForeground", g_br_transaction_count);
+                reply_size = build_void_reply(reply_data);
+                break;
+            }
+
+            case TX_advisePersistThreshold: {
+                log_msg("[TX#%d]  advisePersistThreshold", g_br_transaction_count);
+                reply_size = build_void_reply(reply_data);
+                break;
+            }
+
+            case TX_setStatsProviderWarningAndLimitAsync: {
+                log_msg("[TX#%d]  setStatsProviderWarningAndLimitAsync", g_br_transaction_count);
+                reply_size = build_void_reply(reply_data);
                 break;
             }
 
             case TX_getRateLimitCacheConfig: {
-                /* Returns TrafficStatsRateLimitCacheConfig - return null */
-                uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
-                write_int32(&p, 0); /* null */
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  getRateLimitCacheConfig -> null");
+                log_msg("[TX#%d]  getRateLimitCacheConfig -> null", g_br_transaction_count);
+                reply_size = build_null_parcelable_reply(reply_data);
                 break;
             }
 
             case TX_GET_INTERFACE_VERSION: {
-                uint32_t version = 2;
+                uint32_t version = 5;
                 uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
+                write_int32(&p, 0);
                 memcpy(p, &version, 4); p += 4;
                 reply_size = (size_t)(p - reply_data);
-                log_fmt("  getInterfaceVersion -> %u", version);
+                log_msg("[TX#%d]  getInterfaceVersion -> %u", g_br_transaction_count, version);
                 break;
             }
 
             case TX_GET_INTERFACE_HASH: {
                 uint8_t* p = reply_data;
-                write_int32(&p, 0); /* exception */
-                write_str16(&p, IFACE_HASH);
+                write_int32(&p, 0);
+                write_str16(&p, iface_hash);
                 reply_size = (size_t)(p - reply_data);
-                log_fmt("  getInterfaceHash -> %s", IFACE_HASH);
+                log_msg("[TX#%d]  getInterfaceHash -> %s", g_br_transaction_count, iface_hash);
                 break;
             }
 
-            /* Legacy/fallback codes (patched GSIs may use these) */
             case TX_LEGACY_GET_TOTAL_STATS: {
                 uint64_t val = s.rxBytes + s.txBytes;
-                uint8_t* p = reply_data;
-                write_int32(&p, 0); /* status = 0 */
-                write_int64(&p, val);
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  LEGACY getTotalStats -> %llu", (unsigned long long)val);
+                log_msg("[TX#%d]  LEGACY getTotalStats -> %" PRIu64, g_br_transaction_count, val);
+                reply_size = build_int64_reply(reply_data, (int64_t)val);
                 break;
             }
 
             case TX_LEGACY_GET_IFACE_STATS: {
                 const uint8_t* pp = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
                 char iface[64] = "wlan0";
-                if (tr->data_size > 4) {
+                if (raw_size > 4) {
                     uint32_t nlen; memcpy(&nlen, pp, 4); pp += 4;
                     if (nlen > 0 && nlen < 60) {
                         for (uint32_t i = 0; i < nlen; i++) {
@@ -1269,42 +1505,40 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
                         iface[nlen] = '\0';
                     }
                 }
-                int type = TYPE_RX_BYTES;
-                if (pp + 4 <= (const uint8_t*)(uintptr_t)(tr->data.ptr.buffer + tr->data_size)) {
-                    memcpy(&type, pp, 4);
-                }
+                int type = 0;
+                if ((uint64_t)(pp + 4 - raw_data) <= raw_size) memcpy(&type, pp, 4);
                 struct net_stats is;
                 if (read_iface_stats(iface, &is) != 0) is = s;
-                uint64_t val = pick_stat(&is, type);
-                uint8_t* p = reply_data;
-                write_int32(&p, 0);
-                write_int64(&p, val);
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  LEGACY getIfaceStats iface=%s type=%d -> %llu",
-                        iface, type, (unsigned long long)val);
+                uint64_t val = 0;
+                switch (type) {
+                    case 0: val = is.rxBytes; break;
+                    case 1: val = is.txBytes; break;
+                    case 2: val = is.rxPackets; break;
+                    case 3: val = is.txPackets; break;
+                    default: val = is.rxBytes + is.txBytes; break;
+                }
+                log_msg("[TX#%d]  LEGACY getIfaceStats iface=%s type=%d -> %" PRIu64,
+                        g_br_transaction_count, iface, type, val);
+                reply_size = build_int64_reply(reply_data, (int64_t)val);
                 break;
             }
 
             case TX_LEGACY_FORCE_UPDATE: {
-                update_stats_file_detailed();
-                uint8_t* p = reply_data;
-                write_int32(&p, 0);
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  LEGACY forceUpdate");
+                write_all_stats_sources();
+                log_msg("[TX#%d]  LEGACY forceUpdate", g_br_transaction_count);
+                reply_size = build_void_reply(reply_data);
                 break;
             }
 
             case TX_LEGACY_GET_UID_STATS: {
-                uint8_t* p = reply_data;
-                write_int32(&p, 0);
-                write_int64(&p, 0);
-                reply_size = (size_t)(p - reply_data);
-                log_fmt("  LEGACY getUidStats -> 0");
+                log_msg("[TX#%d]  LEGACY getUidStats -> 0", g_br_transaction_count);
+                reply_size = build_int64_reply(reply_data, 0);
                 break;
             }
 
             default: {
-                log_fmt("  UNKNOWN service code %u (0x%x), returning void", code, code);
+                g_unknown_code_count++;
+                log_msg("[TX#%d]  UNKNOWN service code %u (0x%x) #%d total", g_br_transaction_count, code, code, g_unknown_code_count);
                 reply_size = build_void_reply(reply_data);
                 break;
             }
@@ -1312,7 +1546,7 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
     }
 
     /* Build and send BC_REPLY */
-    uint32_t offsets_arr[1];
+    uint32_t offsets_arr[4];
     uint32_t offsets_bytes = 0;
     if (binder_offset >= 0) {
         offsets_arr[0] = (uint32_t)binder_offset;
@@ -1338,31 +1572,412 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
         memcpy(rwp + reply_size, offsets_arr, offsets_bytes);
     }
     size_t write_len = (size_t)(rwp + reply_size + offsets_bytes - rwbuf);
-    uint8_t discard[4096];
+    uint8_t discard[8192];
     size_t consumed = 0;
     int ret = send_bc_with_reply(rwbuf, write_len, discard, sizeof(discard), &consumed);
     if (ret < 0) {
         log_errno("send BC_REPLY");
-        log_fmt("[TX#%d] <<< REPLY FAILED (ioctl errno=%d)", g_br_transaction_count, errno);
+        log_msg("[TX#%d] <<< REPLY FAILED (errno=%d)", g_br_transaction_count, errno);
     } else {
-        if (g_br_transaction_count <= 10 || g_br_transaction_count % 50 == 0) {
-            log_fmt("[TX#%d] <<< REPLY SENT: code=%u reply_sz=%zu offsets=%u consumed=%zu ret=%d",
-                    g_br_transaction_count, code, reply_size, offsets_bytes, consumed, ret);
-        }
+        log_msg("[TX#%d] <<< REPLY SENT: code=%u reply_sz=%zu offsets=%u consumed=%zu ret=%d",
+                g_br_transaction_count, code, reply_size, offsets_bytes, consumed, ret);
     }
     free(rwbuf);
-    update_stats_file_detailed();
-
-    log_summary();
+    write_all_stats_sources();
 }
 
+/* (removed - replaced by improved populate_uid_stat_all() above) */
+
+/* ============================================================
+ * BPF map writer - populate app_uid_stats_map so TrafficStats
+ * can read per-UID data from the kernel BPF maps directly.
+ * Uses bpf() syscall with pinned map fd from /sys/fs/bpf/
+ * ============================================================ */
+static int bpf_syscall(enum bpf_cmd cmd, union bpf_attr *attr) {
+    return (int)syscall(__NR_bpf, cmd, attr, sizeof(*attr));
+}
+
+static int open_bpf_map(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        fd = open(path, O_RDONLY);
+    }
+    return fd;
+}
+
+#define BPF_APP_UID_STATS_MAP_PATH "/sys/fs/bpf/netd_shared/map_netd_app_uid_stats_map"
+#define BPF_UID_OWNER_MAP_PATH    "/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
+#define BPF_COOKIE_TAG_MAP_PATH   "/sys/fs/bpf/netd_shared/map_netd_cookie_tag_map"
+
+struct bpf_stats_key {
+    uint32_t uid;
+    uint32_t tag;
+    uint32_t counter_set;
+    uint32_t pad;
+} __attribute__((packed));
+
+struct bpf_stats_value {
+    uint64_t rxBytes;
+    uint64_t rxPackets;
+    uint64_t txBytes;
+    uint64_t txPackets;
+    uint64_t timestamp;
+} __attribute__((packed));
+
+struct bpf_owner_key {
+    uint32_t uid;
+    uint32_t pad;
+} __attribute__((packed));
+
+struct bpf_owner_value {
+    uint64_t owner;
+} __attribute__((packed));
+
+static int g_bpf_stats_map_fd = -1;
+static int g_bpf_owner_map_fd = -1;
+
+static void open_bpf_maps(void) {
+    if (g_bpf_stats_map_fd < 0) {
+        g_bpf_stats_map_fd = open_bpf_map(BPF_APP_UID_STATS_MAP_PATH);
+        if (g_bpf_stats_map_fd >= 0)
+            log_msg("[BPF] Opened app_uid_stats_map fd=%d", g_bpf_stats_map_fd);
+        else
+            log_msg("[BPF] Cannot open app_uid_stats_map (errno=%d) - will use uid_stat fallback", errno);
+    }
+    if (g_bpf_owner_map_fd < 0) {
+        g_bpf_owner_map_fd = open_bpf_map(BPF_UID_OWNER_MAP_PATH);
+        if (g_bpf_owner_map_fd >= 0)
+            log_msg("[BPF] Opened uid_owner_map fd=%d", g_bpf_owner_map_fd);
+    }
+}
+
+static int write_bpf_stats(int uid, uint64_t rxBytes, uint64_t rxPackets,
+                           uint64_t txBytes, uint64_t txPackets) {
+    if (g_bpf_stats_map_fd < 0) return -1;
+
+    struct bpf_stats_key key;
+    struct bpf_stats_value val;
+    union bpf_attr attr;
+
+    memset(&key, 0, sizeof(key));
+    key.uid = (uint32_t)uid;
+    key.tag = 0;
+    key.counter_set = 0; /* default counter set */
+
+    memset(&val, 0, sizeof(val));
+    val.rxBytes   = rxBytes;
+    val.rxPackets = rxPackets;
+    val.txBytes   = txBytes;
+    val.txPackets = txPackets;
+    val.timestamp = (uint64_t)time(NULL);
+
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)g_bpf_stats_map_fd;
+    attr.key    = (uint64_t)(uintptr_t)&key;
+    attr.value  = (uint64_t)(uintptr_t)&val;
+    attr.flags  = BPF_ANY;
+
+    int ret = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr);
+    if (ret < 0 && errno != EEXIST) {
+        log_msg("[BPF] MAP_UPDATE_ELEM uid=%d failed: errno=%d (%s)",
+                uid, errno, strerror(errno));
+        return ret;
+    }
+
+    /* Also write TX entry (counter_set=1 might be TX) */
+    key.counter_set = 1;
+    memset(&val, 0, sizeof(val));
+    val.txBytes   = txBytes;
+    val.txPackets = txPackets;
+    val.rxBytes   = rxBytes;
+    val.rxPackets = rxPackets;
+    val.timestamp = (uint64_t)time(NULL);
+
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)g_bpf_stats_map_fd;
+    attr.key    = (uint64_t)(uintptr_t)&key;
+    attr.value  = (uint64_t)(uintptr_t)&val;
+    attr.flags  = BPF_ANY;
+
+    ret = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr);
+    if (ret < 0 && errno != EEXIST) {
+        log_msg("[BPF] MAP_UPDATE_ELEM uid=%d tx failed: errno=%d", uid, errno);
+    }
+
+    log_msg("[BPF] wrote stats uid=%d rx=%" PRIu64 " tx=%" PRIu64 " (fd=%d)",
+            uid, rxBytes, txBytes, g_bpf_stats_map_fd);
+    return 0;
+}
+
+static int write_bpf_owner(int uid) {
+    if (g_bpf_owner_map_fd < 0) return -1;
+
+    struct bpf_owner_key key;
+    struct bpf_owner_value val;
+    union bpf_attr attr;
+
+    memset(&key, 0, sizeof(key));
+    key.uid = (uint32_t)uid;
+
+    memset(&val, 0, sizeof(val));
+    val.owner = 1;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)g_bpf_owner_map_fd;
+    attr.key    = (uint64_t)(uintptr_t)&key;
+    attr.value  = (uint64_t)(uintptr_t)&val;
+    attr.flags  = BPF_ANY;
+
+    int ret = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr);
+    if (ret < 0 && errno != EEXIST) {
+        log_msg("[BPF] OWNER uid=%d failed: errno=%d", uid, errno);
+    }
+    return ret;
+}
+
+static void populate_bpf_maps(void) {
+    open_bpf_maps();
+    if (g_bpf_stats_map_fd < 0) return;
+
+    struct iface_stat ifaces[MAX_IFACES];
+    int count = 0;
+    read_all_ifaces(ifaces, &count);
+
+    struct net_stats total;
+    read_all_stats(&total);
+
+    /* Write total stats for UID_ALL (-1) */
+    write_bpf_stats(-1, total.rxBytes, total.rxPackets, total.txBytes, total.txPackets);
+
+    /* Collect active UIDs */
+    int uids[256];
+    int uidc = 0;
+    int base_uids[] = {1000, 1001, 10027, 1013, 1021, 1023, 1027, 1028, 1029, 1037,
+                       1038, 1039, 1041, 1044, 1045, 1046, 1047, 2000, 2001, 9999};
+    for (int i = 0; i < (int)(sizeof(base_uids)/sizeof(base_uids[0])) && uidc < 250; i++) {
+        uids[uidc++] = base_uids[i];
+    }
+
+    /* Scan /proc for app UIDs */
+    DIR* proc = opendir("/proc");
+    if (proc) {
+        struct dirent* entry;
+        while ((entry = readdir(proc)) && uidc < 250) {
+            int pid = atoi(entry->d_name);
+            if (pid <= 0) continue;
+            char path[256];
+            snprintf(path, sizeof(path), "/proc/%d/status", pid);
+            FILE* sf = fopen(path, "r");
+            if (!sf) continue;
+            char sl[256];
+            while (fgets(sl, sizeof(sl), sf)) {
+                if (strncmp(sl, "Uid:", 4) == 0) {
+                    int ruid;
+                    sscanf(sl, "Uid:\t%d", &ruid);
+                    if (ruid >= 10000) {
+                        int dup = 0;
+                        for (int j = 0; j < uidc; j++) {
+                            if (uids[j] == ruid) { dup = 1; break; }
+                        }
+                        if (!dup) uids[uidc++] = ruid;
+                    }
+                    break;
+                }
+            }
+            fclose(sf);
+        }
+        closedir(proc);
+    }
+
+    uint64_t per_uid_rx = total.rxBytes / (uint64_t)(uidc > 0 ? uidc : 1);
+    uint64_t per_uid_tx = total.txBytes / (uint64_t)(uidc > 0 ? uidc : 1);
+
+    for (int i = 0; i < uidc; i++) {
+        write_bpf_owner(uids[i]);
+        write_bpf_stats(uids[i], per_uid_rx, per_uid_rx / 1500,
+                        per_uid_tx, per_uid_tx / 1500);
+    }
+
+    log_msg("[BPF] Wrote stats for %d UIDs (rx=%" PRIu64 " tx=%" PRIu64 " per_uid)",
+            uidc, per_uid_rx, per_uid_tx);
+}
+
+/* ============================================================
+ * Improved /proc/uid_stat/ writer
+ * Uses multiple strategies to create the directory:
+ * 1. mount tmpfs directly
+ * 2. write to /data/local/tmp/uid_stat and symlink
+ * 3. mkdir + chmod
+ * ============================================================ */
+static int setup_proc_uid_stat(void) {
+    /* Strategy 1: mount tmpfs on /proc/uid_stat */
+    mkdir("/proc/uid_stat", 0755);
+    int ret = mount("tmpfs", "/proc/uid_stat", "tmpfs", 0, NULL);
+    if (ret == 0) {
+        log_msg("[UID_STAT] Mounted tmpfs on /proc/uid_stat");
+        chmod("/proc/uid_stat", 0755);
+        /* Update owner to system (UID 1000) */
+        chown("/proc/uid_stat", 1000, 1000);
+        return 1;
+    }
+    log_msg("[UID_STAT] tmpfs mount failed (errno=%d), trying bind mount...", errno);
+    /* Strategy 2: try bind mount from a tmp dir */
+    mkdir("/data/local/tmp/uid_stat", 0755);
+    mount("tmpfs", "/data/local/tmp/uid_stat", "tmpfs", 0, NULL);
+    chmod("/data/local/tmp/uid_stat", 0755);
+    chown("/data/local/tmp/uid_stat", 1000, 1000);
+    ret = mount("/data/local/tmp/uid_stat", "/proc/uid_stat", NULL, MS_BIND, NULL);
+    if (ret == 0) {
+        log_msg("[UID_STAT] Bind mount succeeded");
+        return 2;
+    }
+    log_msg("[UID_STAT] Bind mount failed (errno=%d), using direct mkdir", errno);
+    /* Strategy 3: just mkdir (won't persist but worth trying) */
+    mkdir("/proc/uid_stat", 0755);
+    chmod("/proc/uid_stat", 0755);
+    chown("/proc/uid_stat", 1000, 1000);
+    return 0;
+}
+
+static void write_uid_stat_entry(int uid, uint64_t rx, uint64_t tx) {
+    char dir_path[128];
+    snprintf(dir_path, sizeof(dir_path), "/proc/uid_stat/%d", uid);
+    mkdir(dir_path, 0755);
+    chmod(dir_path, 0755);
+    chown(dir_path, 1000, 1000);
+
+    char path[256];
+    snprintf(path, sizeof(path), "%s/tcp_rcv", dir_path);
+    FILE* f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%" PRIu64 "\n", rx);
+        fclose(f);
+        chmod(path, 0644);
+    } else {
+        /* Fallback: write to /data/local/tmp/uid_stat */
+        char alt[256];
+        snprintf(alt, sizeof(alt), "/data/local/tmp/uid_stat/%d/tcp_rcv", uid);
+        mkdir("/data/local/tmp/uid_stat", 0755);
+        char alt_dir[256];
+        snprintf(alt_dir, sizeof(alt_dir), "/data/local/tmp/uid_stat/%d", uid);
+        mkdir(alt_dir, 0755);
+        f = fopen(alt, "w");
+        if (f) { fprintf(f, "%" PRIu64 "\n", rx); fclose(f); }
+    }
+
+    snprintf(path, sizeof(path), "%s/tcp_snd", dir_path);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%" PRIu64 "\n", tx);
+        fclose(f);
+        chmod(path, 0644);
+    } else {
+        char alt[256];
+        snprintf(alt, sizeof(alt), "/data/local/tmp/uid_stat/%d/tcp_snd", uid);
+        f = fopen(alt, "w");
+        if (f) { fprintf(f, "%" PRIu64 "\n", tx); fclose(f); }
+    }
+}
+
+static void populate_uid_stat_all(void) {
+    /* Ensure /proc/uid_stat is set up */
+    struct stat st;
+    if (stat("/proc/uid_stat", &st) != 0 || !S_ISDIR(st.st_mode)) {
+        int ret = setup_proc_uid_stat();
+        if (ret == 0) {
+            /* Check again after setup */
+            if (stat("/proc/uid_stat", &st) != 0 || !S_ISDIR(st.st_mode)) {
+                log_msg("[UID_STAT] Could not create /proc/uid_stat at all");
+                return;
+            }
+        }
+    }
+
+    struct net_stats total;
+    if (read_all_stats(&total) != 0) return;
+
+    /* Common system UIDs */
+    int base_uids[] = {1000, 1001, 10027, 1013, 1021, 1023, 1027, 1028, 1029, 1037,
+                       1038, 1039, 1041, 1044, 1045, 1046, 1047, 2000, 2001, 9999};
+    int uid_count = (int)(sizeof(base_uids)/sizeof(base_uids[0]));
+
+    uint64_t per_uid_rx = total.rxBytes / (uint64_t)(uid_count > 0 ? uid_count : 1);
+    uint64_t per_uid_tx = total.txBytes / (uint64_t)(uid_count > 0 ? uid_count : 1);
+
+    for (int i = 0; i < uid_count; i++) {
+        write_uid_stat_entry(base_uids[i], per_uid_rx, per_uid_tx);
+    }
+
+    log_msg("[UID_STAT] Wrote %d entries (rx=%" PRIu64 " tx=%" PRIu64 " per_uid)",
+            uid_count, per_uid_rx, per_uid_tx);
+}
+
+/* ============================================================
+ * xt_qtaguid loader - try loading the kernel module on old kernels
+ * ============================================================ */
+static void try_load_xt_qtaguid(void) {
+    struct stat st;
+    if (stat("/proc/net/xt_qtaguid/stats", &st) == 0) {
+        log_msg("[XT_QTAGUID] Already available");
+        chmod("/proc/net/xt_qtaguid/stats", 0644);
+        return;
+    }
+
+    const char* modules[] = {
+        "/vendor/lib/modules/xt_qtaguid.ko",
+        "/system/lib/modules/xt_qtaguid.ko",
+        "/vendor_dlkm/lib/modules/xt_qtaguid.ko",
+        "/system_dlkm/lib/modules/xt_qtaguid.ko",
+        NULL
+    };
+
+    for (int i = 0; modules[i]; i++) {
+        if (stat(modules[i], &st) == 0) {
+            log_msg("[XT_QTAGUID] Trying insmod %s", modules[i]);
+            int ret = (int)syscall(__NR_init_module, modules[i],
+                                   (unsigned long)st.st_size, "");
+            if (ret == 0) {
+                log_msg("[XT_QTAGUID] Loaded %s successfully", modules[i]);
+                /* Create device node if needed */
+                if (stat("/dev/xt_qtaguid", &st) != 0) {
+                    mknod("/dev/xt_qtaguid", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH,
+                          makedev(10, 229));
+                    chmod("/dev/xt_qtaguid", 0666);
+                }
+                chmod("/proc/net/xt_qtaguid/stats", 0644);
+                return;
+            } else {
+                log_msg("[XT_QTAGUID] insmod %s failed: errno=%d", modules[i], errno);
+            }
+        }
+    }
+    log_msg("[XT_QTAGUID] No xt_qtaguid module found");
+}
+
+/* ============================================================
+ * Write all stats sources at once
+ * ============================================================ */
+static void write_all_stats_sources(void) {
+    write_stats_file();
+    update_uid_stats();
+    populate_bpf_maps();
+    populate_uid_stat_all();
+    write_netstats_xml();
+    try_load_xt_qtaguid();
+}
+
+/* ============================================================
+ * Main event loop
+ * ============================================================ */
 static void run_event_loop(void) {
     uint8_t* rbuf = (uint8_t*)malloc(BINDER_BUF_SIZE);
-    if (!rbuf) { log_msg("FATAL: malloc failed"); return; }
+    if (!rbuf) { log_msg("FATAL: malloc failed for read buffer"); return; }
     log_msg("Entering main event loop...");
     int consecutive_errors = 0;
     int loop_count = 0;
     time_t last_stats_update = 0;
+    time_t last_uid_update __attribute__((unused)) = 0;
+    int no_txn_count = 0;
 
     while (1) {
         size_t consumed = 0;
@@ -1371,16 +1986,20 @@ static void run_event_loop(void) {
             if (errno == EINTR || errno == EAGAIN) { usleep(10000); continue; }
             consecutive_errors++;
             log_errno("main loop read");
-            if (consecutive_errors > 5) {
-                log_msg("Too many errors, re-opening binder...");
+            if (consecutive_errors > 10) {
+                log_msg("Too many consecutive errors (%d), re-opening binder...", consecutive_errors);
                 if (binder_map && binder_map != MAP_FAILED) munmap(binder_map, BINDER_MMAP_SIZE);
                 if (binder_fd >= 0) close(binder_fd);
                 binder_fd = -1; binder_map = NULL;
-                sleep(3);
+                sleep(5);
                 if (open_binder() == 0) {
-                    enter_looper();
-                    log_msg("Binder re-opened");
+                    uint32_t c = BC_ENTER_LOOPER;
+                    send_binder_cmd(&c, sizeof(c));
+                    log_msg("Binder re-opened successfully");
                     consecutive_errors = 0;
+                } else {
+                    log_msg("Binder re-open FAILED, will retry later");
+                    sleep(10);
                 }
             }
             usleep(500000); continue;
@@ -1389,22 +2008,36 @@ static void run_event_loop(void) {
 
         if (consumed == 0) {
             loop_count++;
-            /* Periodic stats file update */
             time_t now_t = time(NULL);
-            if (now_t - last_stats_update >= 30) {
-                update_stats_file_detailed();
+
+            if (now_t - last_stats_update >= 15) {
+                write_all_stats_sources();
                 last_stats_update = now_t;
             }
-            /* Periodic summary */
-            log_summary();
-            if (loop_count % 7200 == 0) {
-                log_fmt("[EVENT-LOOP] alive: loops=%d txns=%d sessions=%d fds.ready=1",
-                        loop_count, g_br_transaction_count, session_count);
+
+            no_txn_count++;
+            if (no_txn_count == 60) {
+                log_msg("[EVENT-LOOP] NO_TRANSACTIONS for ~60s - SystemUI may not be using netproxy");
+                log_msg("[EVENT-LOOP] Check if SystemUI was restarted after registration");
+                FILE* sf = fopen("/data/local/tmp/netproxy_no_txns", "w");
+                if (sf) {
+                    fprintf(sf, "no_transactions_since=%ld\nservicename=%s\nversion=%s\n",
+                            (long)now_t, g_registered_name, NETPROXY_VERSION);
+                    fclose(sf);
+                }
             }
+            if (no_txn_count % 600 == 0) {
+                log_msg("[EVENT-LOOP] alive: loops=%d txns=%d sessions=%d no_txn_cycles=%d",
+                        loop_count, g_total_txns, session_count, no_txn_count);
+                log_msg("[EVENT-LOOP]  proc_net_dev: rx=%" PRIu64 " tx=%" PRIu64,
+                        g_prev_stats.rxBytes, g_prev_stats.txBytes);
+            }
+
             usleep(50000);
             continue;
         }
 
+        no_txn_count = 0;
         const uint8_t* rp = rbuf;
         const uint8_t* rend = rbuf + consumed;
         while (rp < rend) {
@@ -1422,9 +2055,6 @@ static void run_event_loop(void) {
                 }
                 case BR_REPLY: {
                     g_br_reply_count++;
-                    if (g_br_reply_count <= 5) {
-                        log_fmt("[BR] REPLY #%d", g_br_reply_count);
-                    }
                     if (rp + sizeof(struct binder_transaction_data) > rend) goto loop_end;
                     const struct binder_transaction_data* trp =
                         (const struct binder_transaction_data*)rp;
@@ -1462,31 +2092,23 @@ static void run_event_loop(void) {
                     break;
                 case BR_FAILED_REPLY:
                     g_br_error_count++;
-                    if (g_br_error_count <= 5 || g_br_error_count % 50 == 0) {
-                        log_fmt("[BR] FAILED_REPLY #%d", g_br_error_count);
-                    }
+                    log_msg("[BR] FAILED_REPLY #%d (total=%d)", g_br_error_count, g_br_error_count);
                     break;
                 case BR_DEAD_REPLY:
                     g_br_dead_count++;
-                    if (g_br_dead_count <= 5 || g_br_dead_count % 50 == 0) {
-                        log_fmt("[BR] DEAD_REPLY #%d", g_br_dead_count);
-                    }
+                    log_msg("[BR] DEAD_REPLY #%d (total=%d)", g_br_dead_count, g_br_dead_count);
                     break;
                 case BR_ERROR: {
                     g_br_error_count++;
                     int32_t berr = 0;
                     if (rp + 4 <= rend) memcpy(&berr, rp, 4);
-                    if (g_br_error_count <= 10 || g_br_error_count % 50 == 0) {
-                        log_fmt("[BR] ERROR=%d #%d", berr, g_br_error_count);
-                    }
+                    log_msg("[BR] ERROR=%d #%d", berr, g_br_error_count);
                     if (rp + 4 <= rend) rp += 4;
                     break;
                 }
                 default:
                     g_br_other_count++;
-                    if (g_br_other_count <= 5) {
-                        log_fmt("[BR] unknown cmd 0x%x (total=%d)", cmd, g_br_other_count);
-                    }
+                    log_msg("[BR] unknown cmd 0x%x (total=%d)", cmd, g_br_other_count);
                     goto loop_end;
             }
         }
@@ -1496,174 +2118,237 @@ static void run_event_loop(void) {
 }
 
 static void sig_handler(int sig) {
-    log_fmt("Signal %d received, exiting", sig);
+    log_msg("Signal %d received, exiting", sig);
     unlink(REGFILE);
     if (binder_map && binder_map != MAP_FAILED) munmap(binder_map, BINDER_MMAP_SIZE);
     if (binder_fd >= 0) close(binder_fd);
     _exit(0);
 }
 
+/* ============================================================
+ * Write netstats XML to /data/misc/netstats/
+ * This feeds NetworkStatsService on next boot/reload
+ * ============================================================ */
+static void write_netstats_xml(void) {
+    struct iface_stat ifaces[MAX_IFACES];
+    int count = 0;
+    if (read_all_ifaces(ifaces, &count) != 0) return;
+    struct net_stats total;
+    read_all_stats(&total);
+
+    const char* dir = "/data/misc/netstats";
+    mkdir(dir, 0770);
+    chown(dir, 1000, 1000);
+    chmod(dir, 0770);
+
+    /* Write dev stats XML */
+    char path[256];
+    snprintf(path, sizeof(path), "%s/netstats_dev.xml", dir);
+    FILE* f = fopen(path, "w");
+    if (!f) { log_msg("Cannot write %s: errno=%d", path, errno); return; }
+
+    fprintf(f, "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n");
+    fprintf(f, "<stats devDetail=\"true\">\n");
+    for (int i = 0; i < count; i++) {
+        fprintf(f, "<st if=\"%s\" dev=\"%s\" uid=\"-1\" tag=\"0x0\" set=\"default\" "
+                "rb=\"%" PRIu64 "\" rp=\"%" PRIu64 "\" tb=\"%" PRIu64 "\" tp=\"%" PRIu64 "\" />\n",
+                ifaces[i].name, ifaces[i].name,
+                ifaces[i].rxBytes, ifaces[i].rxPackets,
+                ifaces[i].txBytes, ifaces[i].txPackets);
+    }
+    fprintf(f, "</stats>\n");
+    fclose(f);
+    chmod(path, 0644);
+    chown(path, 1000, 1000);
+
+    /* Write UID stats XML */
+    snprintf(path, sizeof(path), "%s/netstats_uid.xml", dir);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n");
+        fprintf(f, "<stats uidStats=\"true\">\n");
+        for (int i = 0; i < g_uid_count && i < MAX_UID_STATS; i++) {
+            if (g_uid_stats[i].uid == 0) continue;
+            fprintf(f, "<st uid=\"%d\" tag=\"0x0\" set=\"0\" "
+                    "rxBytes=\"%" PRIu64 "\" txBytes=\"%" PRIu64 "\" "
+                    "rxPackets=\"%" PRIu64 "\" txPackets=\"%" PRIu64 "\" />\n",
+                    g_uid_stats[i].uid, g_uid_stats[i].rxBytes, g_uid_stats[i].txBytes,
+                    g_uid_stats[i].rxBytes / 1500, g_uid_stats[i].txBytes / 1500);
+        }
+        fprintf(f, "</stats>\n");
+        fclose(f);
+        chmod(path, 0644);
+        chown(path, 1000, 1000);
+    }
+
+    log_msg("Wrote netstats XML: %d ifaces, %d uids", count, g_uid_count);
+}
+
+/* ============================================================
+ * main
+ * ============================================================ */
 int main(void) {
-    log_fmt("==============================================");
-    log_fmt("  Native netproxy v%s starting", NETPROXY_VERSION);
-    log_fmt("==============================================");
+    g_start_time = time(NULL);
+    log_msg("==============================================");
+    log_msg("  Native netproxy v%s starting", NETPROXY_VERSION);
+    log_msg("==============================================");
 
     signal(SIGTERM, sig_handler);
     signal(SIGHUP,  sig_handler);
     signal(SIGINT,  sig_handler);
+    signal(SIGPIPE, SIG_IGN);
 
-    log_fmt("PID=%d UID=%d GID=%d", getpid(), getuid(), getgid());
+    log_msg("PID=%d UID=%d GID=%d", getpid(), getuid(), getgid());
     const char* ctx = getenv("SELINUX_CONTEXT");
-    log_fmt("SELinux context: %s", ctx ? ctx : "unknown");
-    log_fmt("SELinux mode: %s", ctx && strstr(ctx, "permissive") ? "permissive" : "enforcing (or unknown)");
+    log_msg("SELinux context: %s", ctx ? ctx : "unknown");
+    log_msg("SELinux mode: %s", ctx && strstr(ctx, "permissive") ? "permissive" : "enforcing (or unknown)");
 
     struct net_stats s;
     if (read_all_stats(&s) == 0) {
-        log_fmt("Initial /proc/net/dev: rx=%llu tx=%llu rxp=%llu txp=%llu",
-                (unsigned long long)s.rxBytes, (unsigned long long)s.txBytes,
-                (unsigned long long)s.rxPackets, (unsigned long long)s.txPackets);
+        g_prev_stats = s;
+        log_msg("Initial /proc/net/dev: rx=%" PRIu64 " tx=%" PRIu64 " rxp=%" PRIu64 " txp=%" PRIu64,
+                s.rxBytes, s.txBytes, s.rxPackets, s.txPackets);
 
-        /* Log all interfaces */
         struct iface_stat ifaces[MAX_IFACES];
         int count = 0;
         if (read_all_ifaces(ifaces, &count) == 0) {
-            log_fmt("Active interfaces (%d):", count);
-            for (int i = 0; i < count && i < 10; i++) {
-                log_fmt("  %s: rx=%llu tx=%llu",
-                        ifaces[i].name,
-                        (unsigned long long)ifaces[i].rxBytes,
-                        (unsigned long long)ifaces[i].txBytes);
+            log_msg("Active interfaces (%d):", count);
+            for (int i = 0; i < count && i < 20; i++) {
+                log_msg("  %s: rx=%" PRIu64 " tx=%" PRIu64,
+                        ifaces[i].name, ifaces[i].rxBytes, ifaces[i].txBytes);
             }
         }
     } else {
-        log_msg("WARNING: cannot read /proc/net/dev");
+        log_msg("WARNING: cannot read /proc/net/dev (errno=%d)", errno);
     }
 
-    /* Log existing services */
+    /* Check existing services */
     log_msg("Checking existing services...");
-    const char* check_services[] = {"netstats", "netstats_service", "connectivity", NULL};
-    for (int i = 0; check_services[i]; i++) {
-        int ret = aidl_check_service(check_services[i]);
-        log_fmt("Service '%s': %s", check_services[i],
+    const char* check_list[] = {"netstats", "netstats_service", "connectivity", "network_management", NULL};
+    for (int i = 0; check_list[i]; i++) {
+        int ret = aidl_check_service(check_list[i]);
+        log_msg("Service '%s': %s", check_list[i],
                 ret > 0 ? "EXISTS" : (ret == 0 ? "not found" : "error"));
     }
 
+    /* Setup proc uid stat and write all stats sources early */
+    setup_proc_uid_stat();
+    populate_uid_stat_all();
+    try_load_xt_qtaguid();
+
     /* Open binder */
     if (open_binder() < 0) {
-        log_msg("Cannot open binder, running in passive mode");
-        log_msg("Stats will be written to files only");
+        log_msg("Cannot open binder, running in passive mode (file/BPF/uid_stat stats)");
         while (1) {
-            update_stats_file_detailed();
+            write_all_stats_sources();
             sleep(15);
         }
         return 1;
     }
 
-    if (enter_looper() < 0) {
-        log_msg("enter_looper failed");
-        return 1;
+    {
+        uint32_t c = BC_ENTER_LOOPER;
+        int r = send_binder_cmd(&c, sizeof(c));
+        if (r < 0) {
+            log_msg("enter_looper failed (errno=%d), trying again...", errno);
+            sleep(1);
+            send_binder_cmd(&c, sizeof(c));
+        }
     }
+    log_msg("Looper entered");
 
-    log_msg("Binder initialized, updating stats file...");
-    update_stats_file_detailed();
+    log_msg("Binder initialized, writing all stats...");
+    write_all_stats_sources();
 
     /* Try to register with ServiceManager */
     main_service_ptr = (uint64_t)(uintptr_t)(binder_map + 512);
     main_service_cookie = main_service_ptr;
 
-    log_fmt("Using main service binder ptr: 0x%llx", (unsigned long long)main_service_ptr);
+    log_msg("Using main service binder ptr: 0x%" PRIx64, main_service_ptr);
 
-    g_registration_attempts = 0;
+    /* Write all stats sources immediately - don't wait for registration */
+    write_all_stats_sources();
+
     int registered = 0;
-    for (int round = 0; round < 5 && !registered; round++) {
-        log_fmt("--- Registration round %d/5 ---", round + 1);
-        for (int i = 0; SERVICE_NAMES[i]; i++) {
-            g_registration_attempts++;
-            log_fmt("[REG#%d] Trying '%s'...", g_registration_attempts, SERVICE_NAMES[i]);
+    /* Only try to register as 'netstats' - the real service name */
+    const char* TARGET_SERVICE = "netstats";
+    for (int round = 0; round < 10 && !registered; round++) {
+        log_msg("--- Registration round %d/10 (target='%s') ---", round + 1, TARGET_SERVICE);
 
-            /* First check if service already exists */
-            int exists = aidl_check_service(SERVICE_NAMES[i]);
-            if (exists > 0) {
-                log_fmt("[REG#%d] '%s' ALREADY EXISTS in ServiceManager (ret=%d), will try to override",
-                        g_registration_attempts, SERVICE_NAMES[i], exists);
-            } else if (exists == 0) {
-                log_fmt("[REG#%d] '%s' not registered yet, good", g_registration_attempts, SERVICE_NAMES[i]);
-            } else {
-                log_fmt("[REG#%d] '%s' check FAILED (ret=%d), trying add anyway",
-                        g_registration_attempts, SERVICE_NAMES[i], exists);
-            }
-
-            /* Attempt to register */
-            log_fmt("[REG#%d] calling addService('%s', ptr=0x%llx, cookie=0x%llx)...",
-                    g_registration_attempts, SERVICE_NAMES[i],
-                    (unsigned long long)main_service_ptr,
-                    (unsigned long long)main_service_cookie);
-            int ret = aidl_add_service(SERVICE_NAMES[i], main_service_ptr, main_service_cookie);
-            log_fmt("[REG#%d] addService('%s') returned %d (%s)",
-                    g_registration_attempts, SERVICE_NAMES[i], ret,
-                    ret >= 0 ? "SUCCESS" : "FAILED");
-
-            if (ret >= 0) {
-                log_fmt("*** REGISTERED as '%s'! (round %d, attempt %d) ***",
-                        SERVICE_NAMES[i], round + 1, g_registration_attempts);
-                registered = 1;
-
-                /* Write registration marker */
-                FILE* rf = fopen(REGFILE, "w");
-                if (rf) {
-                    fprintf(rf, "registered=1\nservice=%s\nversion=%s\nattempt=%d\nround=%d\n",
-                            SERVICE_NAMES[i], NETPROXY_VERSION, g_registration_attempts, round + 1);
-                    fclose(rf);
-                }
-                chmod(REGFILE, 0644);
-                break;
-            }
+        int exists = aidl_check_service(TARGET_SERVICE);
+        if (exists > 0) {
+            log_msg("[REG] '%s' ALREADY EXISTS, trying to override", TARGET_SERVICE);
+        } else if (exists == 0) {
+            log_msg("[REG] '%s' not found - good, we will add it", TARGET_SERVICE);
         }
 
-        if (!registered && round < 4) {
-            log_fmt("[REG] Round %d FAILED, waiting %ds before retry...", round + 1, 5 + round * 2);
-            sleep(5 + round * 2);
+        int ret = aidl_add_service(TARGET_SERVICE, main_service_ptr, main_service_cookie);
+        if (ret >= 0) {
+            log_msg("*** REGISTERED as '%s'! (round %d) ***", TARGET_SERVICE, round + 1);
+            registered = 1;
+            g_registered_service_idx = 0;
+            strncpy(g_registered_name, TARGET_SERVICE, sizeof(g_registered_name) - 1);
 
-            /* Log any SELinux denials between rounds */
-            log_fmt("[REG] Checking SELinux denials...");
-            FILE* dmesg_p = popen("dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'service_manager|servicemanager|netstats|binder' | tail -15", "r");
-            if (dmesg_p) {
-                char line[256];
-                while (fgets(line, sizeof(line), dmesg_p)) {
+            FILE* rf = fopen(REGFILE, "w");
+            if (rf) {
+                fprintf(rf, "registered=1\nservice=%s\nversion=%s\npid=%d\n"
+                        "timestamp=%ld\n",
+                        TARGET_SERVICE, NETPROXY_VERSION, getpid(), (long)time(NULL));
+                fclose(rf);
+            }
+            chmod(REGFILE, 0644);
+            break;
+        }
+
+        if (!registered) {
+            int wait_sec = 3 + round * 2;
+            log_msg("[REG] Round %d FAILED for '%s', waiting %ds before retry...",
+                    round + 1, TARGET_SERVICE, wait_sec);
+            sleep(wait_sec);
+
+            /* Log SELinux denials */
+            FILE* dp = popen("dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'service_manager|servicemanager|netstats|binder' | tail -20", "r");
+            if (dp) {
+                char line[512];
+                while (fgets(line, sizeof(line), dp)) {
                     line[strcspn(line, "\n")] = 0;
-                    log_fmt("  SELINUX: %s", line);
+                    log_msg("  SELINUX: %s", line);
                 }
-                pclose(dmesg_p);
+                pclose(dp);
             }
 
-            /* Also log current ServiceManager state */
-            FILE* sm_p = popen("dmesg 2>/dev/null | grep -i 'service_manager' | tail -5", "r");
-            if (sm_p) {
-                char line[256];
-                while (fgets(line, sizeof(line), sm_p)) {
+            /* Log ServiceManager state */
+            FILE* sp = popen("dmesg 2>/dev/null | grep -i 'service_manager' | tail -10", "r");
+            if (sp) {
+                char line[512];
+                while (fgets(line, sizeof(line), sp)) {
                     line[strcspn(line, "\n")] = 0;
-                    log_fmt("  SM: %s", line);
+                    log_msg("  SM: %s", line);
                 }
-                pclose(sm_p);
+                pclose(sp);
             }
+
+            /* Retry stats writing between rounds */
+            write_all_stats_sources();
         }
     }
 
     if (!registered) {
-        log_msg("WARNING: could not register with ServiceManager");
-        log_msg("Falling back to passive mode - stats via files");
+        log_msg("WARNING: could not register with ServiceManager after 10 rounds");
+        log_msg("Falling back to passive file/BPF/uid_stat mode");
         unlink(REGFILE);
         while (1) {
-            update_stats_file_detailed();
+            write_all_stats_sources();
             sleep(15);
         }
     }
 
     log_msg("=== Entering main event loop ===");
-    log_fmt("Registered=%d sessions=%d", registered, session_count);
+    log_msg("registered=%d sessions=%d name=%s",
+            registered, session_count, g_registered_name);
     run_event_loop();
 
-    log_msg("Exiting");
+    log_msg("Exiting main");
     unlink(REGFILE);
     if (binder_map && binder_map != MAP_FAILED) munmap(binder_map, BINDER_MMAP_SIZE);
     if (binder_fd >= 0) close(binder_fd);

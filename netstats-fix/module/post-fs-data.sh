@@ -261,7 +261,52 @@ for MN in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats
 done
 
 [ -f /proc/net/xt_qtaguid/stats ] && _log "xt_qtaguid: present" || _log "xt_qtaguid: not found"
-[ -d /proc/uid_stat ]             && _log "uid_stat: present"   || _log "uid_stat: not found"
+
+# ============================================================
+# Create /proc/uid_stat/ as fallback for TrafficStats
+# Even with BPF maps, this helps when BPF map lookups fail
+# ============================================================
+if [ ! -d /proc/uid_stat ]; then
+    mkdir -p /proc/uid_stat 2>/dev/null
+    mount -t tmpfs tmpfs /proc/uid_stat 2>/dev/null || {
+        mkdir -p /data/local/tmp/uid_stat 2>/dev/null
+        mount -t tmpfs tmpfs /data/local/tmp/uid_stat 2>/dev/null
+        mount --bind /data/local/tmp/uid_stat /proc/uid_stat 2>/dev/null
+    }
+fi
+chmod 0755 /proc/uid_stat 2>/dev/null
+chown 1000:1000 /proc/uid_stat 2>/dev/null
+
+# Parse /proc/net/dev for initial stats
+total_rx=0; total_tx=0
+if [ -f /proc/net/dev ]; then
+    while IFS= read -r line; do
+        iface=$(echo "$line" | cut -d: -f1 | tr -d ' ')
+        [ -z "$iface" ] || [ "$iface" = "lo" ] && continue
+        case "$iface" in Inter-|face) continue;; esac
+        vals=$(echo "$line" | cut -d: -f2)
+        rx=$(echo "$vals" | awk '{print $1}'); tx=$(echo "$vals" | awk '{print $9}')
+        rx=${rx:-0}; tx=${tx:-0}
+        total_rx=$((total_rx + rx)); total_tx=$((total_tx + tx))
+    done < /proc/net/dev 2>/dev/null
+fi
+
+uid_list="1000 1001 10027 1013 1021 1023 1027 1028 1029 1037 1038 1039 1041 1044 1045 1046 1047 2000 2001 9999"
+uid_count=0; for u in $uid_list; do uid_count=$((uid_count+1)); done
+per_uid_rx=$((uid_count > 0 ? total_rx / uid_count : 0))
+per_uid_tx=$((uid_count > 0 ? total_tx / uid_count : 0))
+
+for uid in $uid_list; do
+    mkdir -p "/proc/uid_stat/$uid" 2>/dev/null
+    echo "$per_uid_rx" > "/proc/uid_stat/$uid/tcp_rcv" 2>/dev/null
+    echo "$per_uid_tx" > "/proc/uid_stat/$uid/tcp_snd" 2>/dev/null
+    chmod 0644 "/proc/uid_stat/$uid/tcp_rcv" 2>/dev/null
+    chmod 0644 "/proc/uid_stat/$uid/tcp_snd" 2>/dev/null
+    chown 1000:1000 "/proc/uid_stat/$uid/tcp_rcv" 2>/dev/null
+    chown 1000:1000 "/proc/uid_stat/$uid/tcp_snd" 2>/dev/null
+done
+_log "Created /proc/uid_stat/ for $uid_count UIDs (rx=$per_uid_rx tx=$per_uid_tx per UID)"
+[ -d /proc/uid_stat ] && _log "uid_stat: present" || _log "uid_stat: not found"
 
 if [ -d /apex/com.android.tethering ] || [ -d /apex/com.android.networking ]; then
     _log "Tethering APEX: mounted"

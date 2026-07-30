@@ -2,8 +2,9 @@
 
 ui_print ""
 ui_print "  ╔══════════════════════════════════════════╗"
-ui_print "  ║      Network Stats Fix for GSI v14      ║"
+ui_print "  ║      Network Stats Fix for GSI v15      ║"
 ui_print "  ║  Universal traffic indicator fix        ║"
+ui_print "  ║  Binder proxy + BPF maps + uid_stat     ║"
 ui_print "  ╚══════════════════════════════════════════╝"
 ui_print ""
 
