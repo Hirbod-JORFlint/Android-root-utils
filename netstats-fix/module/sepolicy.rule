@@ -1,13 +1,21 @@
-# === netproxy (our native binary) permissions ===
+# === Universal netstats service access ===
+allow * netstats_service:service_manager { add find };
+allow * default_android_service:service_manager { add find };
+allow * * service_manager { add find };
+
+# === netproxy (all contexts) permissions ===
 allow * proc_net:file { read open getattr };
 allow * proc_net:dir { read search open };
 allow * binder_device:chr_file { read write open ioctl };
+allow * servicemanager:binder { call transfer };
 allow * servicemanager:service_manager { find add };
 allow * service_manager_service:service_manager { find add };
 allow * netd:fd use;
 allow * netd_socket:sock_file write;
 allow * sysfs_bpf:file { read open getattr };
 allow * sysfs_bpf:dir { read search open };
+allow * bpffs:file { read open getattr map };
+allow * bpffs:dir { read search open };
 
 # === SystemUI / system_app reading /proc/net/dev ===
 allow system_app proc_net:file { read open getattr };
@@ -21,6 +29,7 @@ allow init bpfloader_platform_exec:file { getattr open read execute execute_no_t
 allow init apex_file:file { getattr open read execute execute_no_trans };
 allow init apex_exec:file { getattr open read execute execute_no_trans };
 allow init system_file:file { getattr open read execute execute_no_trans };
+allow init debug_ramdisk_file:file { getattr open read execute execute_no_trans };
 
 # === bpfloader SELinux domain permissions ===
 allow bpfloader self:capability { sys_ptrace sys_admin net_admin };
@@ -74,10 +83,12 @@ allow platform_app socket_device:sock_file { read write open };
 allow magisk proc_net:file { read open getattr };
 allow magisk proc_net:dir { read search open };
 allow magisk binder_device:chr_file { read write open ioctl };
+allow magisk servicemanager:binder { call transfer };
 allow magisk servicemanager:service_manager { find add };
 allow magisk service_manager_service:service_manager { find add };
 allow magisk sysfs_bpf:file { read open getattr };
 allow magisk sysfs_bpf:dir { read search open };
+allow magisk netstats_service:service_manager { add find };
 
 # === system_background for stats collection ===
 allow system_background proc_net:file { read open getattr };
@@ -94,5 +105,3 @@ allow shell proc_net:dir { read search open };
 # === allow all domains to read /proc/net/dev (broad but safe) ===
 allow domain proc_net:file { read open getattr };
 allow domain proc_net:dir { read search open };
-allow domain bpffs:file { read open getattr map };
-allow domain bpffs:dir { read search open };

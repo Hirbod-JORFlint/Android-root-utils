@@ -1,17 +1,3 @@
-/*
- * netproxy.c - Native binder proxy for Android network stats
- * Version: 3.0
- *
- * Registers as "netstats" service in ServiceManager and intercepts
- * INetworkStatsService transactions, reading /proc/net/dev directly.
- *
- * Handles:
- *  - Android 14+ (SDK 34+) transaction codes
- *  - Proper binder looper protocol (enter_looper before register)
- *  - BR_ACQUIRE / BR_RELEASE / BR_REQUEST_DEATH_NOTIFICATION responses
- *  - Graceful degradation via /proc/net/dev polling stats file fallback
- *  - Both arm64 and arm32 builds
- */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,9 +17,9 @@
 
 #define LOGFILE "/data/local/tmp/netproxy.log"
 #define STATSFILE "/data/local/tmp/netproxy_stats"
-#define NETPROXY_VERSION "3.0"
+#define REGFILE "/data/local/tmp/netproxy_registered"
+#define NETPROXY_VERSION "4.0"
 
-/* ---- Logging ---- */
 static void log_msg(const char* msg) {
     FILE* f = fopen(LOGFILE, "a");
     if (!f) return;
@@ -64,7 +50,6 @@ static void log_fmt(const char* fmt, ...) {
     log_msg(buf);
 }
 
-/* ---- Parcel helpers ---- */
 static void write_uint32(uint8_t** p, uint32_t v) {
     memcpy(*p, &v, 4); *p += 4;
 }
@@ -91,7 +76,6 @@ static void write_string16(uint8_t** buf, const char* s) {
         uint16_t c = (uint16_t)(unsigned char)s[i];
         memcpy(*buf, &c, 2); *buf += 2;
     }
-    /* null terminator */
     uint16_t nul = 0;
     memcpy(*buf, &nul, 2); *buf += 2;
     align4(buf);
@@ -99,13 +83,11 @@ static void write_string16(uint8_t** buf, const char* s) {
 
 static void skip_string16(const uint8_t** pp) {
     uint32_t len = read_uint32(pp);
-    if (len == 0xFFFFFFFFu) return; /* NULL string */
-    /* len chars + null terminator, each 2 bytes */
+    if (len == 0xFFFFFFFFu) return;
     *pp += (len + 1) * 2;
     align4_const(pp);
 }
 
-/* ---- Read /proc/net/dev ---- */
 struct net_stats {
     uint64_t rxBytes, rxPackets, txBytes, txPackets;
 };
@@ -138,7 +120,7 @@ static int read_iface_stats(const char* iface, struct net_stats* out) {
         }
     }
     fclose(f);
-    return -1; /* iface not found */
+    return -1;
 }
 
 static int read_all_stats(struct net_stats* out) {
@@ -146,13 +128,12 @@ static int read_all_stats(struct net_stats* out) {
     FILE* f = fopen("/proc/net/dev", "r");
     if (!f) return -1;
     char line[512];
-    /* skip 2 header lines */
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
     while (fgets(line, sizeof(line), f)) {
         char* p = line;
         while (*p == ' ' || *p == '\t') p++;
-        if (strncmp(p, "lo:", 3) == 0) continue; /* skip loopback */
+        if (strncmp(p, "lo:", 3) == 0) continue;
         char* colon = strchr(p, ':');
         if (!colon) continue;
         char* vals = colon + 1;
@@ -174,7 +155,6 @@ static int read_all_stats(struct net_stats* out) {
     return 0;
 }
 
-/* Write stats to a fallback file so shell scripts can read them */
 static void update_stats_file(void) {
     struct net_stats s;
     if (read_all_stats(&s) != 0) return;
@@ -189,16 +169,15 @@ static void update_stats_file(void) {
     chmod(STATSFILE, 0644);
 }
 
-/* ---- Binder communication ---- */
-#define BINDER_MMAP_SIZE (1 * 1024 * 1024)  /* 1 MB */
+#define BINDER_MMAP_SIZE (1 * 1024 * 1024)
 #define BINDER_BUF_SIZE  (16 * 1024)
 
 static int binder_fd = -1;
 static uint8_t* binder_map = NULL;
 static uint8_t* binder_local_obj = NULL;
+static int use_new_fbo = 1;
 
 static int open_binder(void) {
-    /* Try /dev/binder first, then /dev/vndbinder */
     const char* paths[] = { "/dev/binder", "/dev/vndbinder", NULL };
     for (int i = 0; paths[i]; i++) {
         binder_fd = open(paths[i], O_RDWR | O_CLOEXEC);
@@ -220,12 +199,13 @@ static int open_binder(void) {
         return -1;
     }
     log_fmt("binder protocol version %d", ver.protocol_version);
-    if (ver.protocol_version != BINDER_CURRENT_PROTOCOL_VERSION) {
-        log_fmt("WARNING: protocol version mismatch (got %d, want %d)",
-                ver.protocol_version, BINDER_CURRENT_PROTOCOL_VERSION);
-    }
 
-    uint32_t max_threads = 4;
+    use_new_fbo = (ver.protocol_version >= 8);
+    log_fmt("using %s flat_binder_object format (ver=%d)",
+            use_new_fbo ? "24-byte (new)" : "28-byte (legacy)",
+            ver.protocol_version);
+
+    uint32_t max_threads = 8;
     ioctl(binder_fd, BINDER_SET_MAX_THREADS, &max_threads);
 
     binder_map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
@@ -256,12 +236,6 @@ static void free_binder_buf(binder_uintptr_t buf_ptr) {
     ioctl(binder_fd, BINDER_WRITE_READ, &fbwr);
 }
 
-/*
- * send_bc - write a binder command and optionally read a reply.
- * write_buf / write_size: data to write.
- * read_buf / read_size:   buffer for reply (may be NULL/0 for fire-and-forget).
- * read_consumed: out-param, bytes actually read.
- */
 static int send_bc(const uint8_t* write_buf, size_t write_size,
                    uint8_t* read_buf, size_t read_size,
                    size_t* read_consumed) {
@@ -277,16 +251,11 @@ static int send_bc(const uint8_t* write_buf, size_t write_size,
     return 0;
 }
 
-/*
- * do_transaction - build and send a BC_TRANSACTION, collect the BC_REPLY.
- * Handles intermediate BR_TRANSACTION_COMPLETE and BR_NOOP.
- */
 static int do_transaction(uint32_t handle, uint32_t code,
                           const uint8_t* data, size_t data_size,
                           uint32_t* offsets, size_t offsets_count,
                           uint8_t* out_reply, size_t out_reply_cap,
                           size_t* out_reply_size) {
-    /* Build write buffer: [BC_TRANSACTION][binder_transaction_data][data][offsets] */
     size_t offsets_bytes = offsets_count * sizeof(uint32_t);
     size_t wbuf_needed = 4 + sizeof(struct binder_transaction_data) + data_size + offsets_bytes + 64;
     uint8_t* wbuf = (uint8_t*)calloc(1, wbuf_needed);
@@ -315,7 +284,6 @@ static int do_transaction(uint32_t handle, uint32_t code,
 
     size_t write_len = (size_t)(wp - wbuf);
 
-    /* Read buffer for reply */
     uint8_t* rbuf = (uint8_t*)calloc(1, out_reply_cap + 256);
     if (!rbuf) { free(wbuf); return -1; }
 
@@ -328,9 +296,8 @@ static int do_transaction(uint32_t handle, uint32_t code,
         int ret;
 
         if (!got_reply && write_len > 0) {
-            /* Send write on first pass, then only read */
             ret = send_bc(wbuf, write_len, rbuf, out_reply_cap + 256, &consumed);
-            write_len = 0; /* sent; don't re-send */
+            write_len = 0;
         } else {
             ret = send_bc(NULL, 0, rbuf, out_reply_cap + 256, &consumed);
         }
@@ -362,7 +329,6 @@ static int do_transaction(uint32_t handle, uint32_t code,
                     break;
                 }
                 case BR_ACQUIRE_RESULT:
-                    /* 4-byte result code; just skip it */
                     if (rp + 4 <= rend) rp += 4;
                     break;
                 case BR_ATTEMPT_ACQUIRE: {
@@ -397,7 +363,6 @@ static int do_transaction(uint32_t handle, uint32_t code,
                 }
                 case BR_ACQUIRE:
                 case BR_INCREFS: {
-                    /* Kernel-side ref; acknowledge with BC_ACQUIRE_DONE/BC_INCREFS_DONE */
                     if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
                         binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
                         binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
@@ -419,10 +384,11 @@ static int do_transaction(uint32_t handle, uint32_t code,
                     if (rp + sizeof(binder_uintptr_t) <= rend)
                         rp += sizeof(binder_uintptr_t);
                     break;
-                case BR_FAILED_REPLY:
-                    log_msg("BR_FAILED_REPLY in transaction");
+                case BR_FAILED_REPLY: {
+                    log_msg("BR_FAILED_REPLY in transaction (ServiceManager rejected)");
                     free(wbuf); free(rbuf);
                     return -1;
+                }
                 case BR_DEAD_REPLY:
                     log_msg("BR_DEAD_REPLY in transaction");
                     free(wbuf); free(rbuf);
@@ -435,10 +401,6 @@ static int do_transaction(uint32_t handle, uint32_t code,
                     return -1;
                 }
                 default:
-                    log_fmt("unexpected cmd 0x%x in transaction", cmd);
-                    /* Skip 8 bytes of payload (common for ptr_cookie) and
-                     * continue searching for BR_REPLY. Do NOT skip remaining
-                     * data as that would lose the reply. */
                     {
                         int skip = 8;
                         const uint8_t* next = rp + skip;
@@ -455,15 +417,8 @@ static int do_transaction(uint32_t handle, uint32_t code,
     return got_reply ? 0 : -1;
 }
 
-/* ---- Enter binder looper ---- */
 static int enter_looper(void) {
     uint32_t cmd = BC_ENTER_LOOPER;
-    /*
-     * CRITICAL: Do NOT pass a read buffer here. BC_ENTER_LOOPER is a write-only
-     * command — the binder driver does not generate an immediate reply.
-     * If we supply a read buffer, the ioctl will block forever waiting for data
-     * that never arrives, and the proxy will never reach register_with_sm().
-     */
     int ret = send_bc((const uint8_t*)&cmd, sizeof(cmd), NULL, 0, NULL);
     if (ret < 0) {
         log_errno("enter_looper send_bc");
@@ -473,53 +428,107 @@ static int enter_looper(void) {
     return 0;
 }
 
-/* ---- ServiceManager protocol ---- */
 #define SM_HANDLE          0
+#define SM_CHECK_SERVICE   1
 #define SM_ADD_SERVICE     3
 
-/* Service names to try — different ROMs register under different names */
 static const char* SERVICE_NAMES[] = {
-    "netstats",          /* standard AOSP */
-    "netstats_service",  /* some GSI variants */
-    "network_stats",     /* alternative naming */
+    "netstats",
+    "netstats_service",
+    "network_stats",
     NULL
 };
 
+static int check_service_exists(const char* name) {
+    uint8_t pbuf[1024];
+    memset(pbuf, 0, sizeof(pbuf));
+    uint8_t* p = pbuf;
+
+    write_uint32(&p, 0);
+    write_string16(&p, "android.os.IServiceManager");
+    write_string16(&p, name);
+
+    size_t psize = (size_t)(p - pbuf);
+
+    uint8_t reply[256];
+    size_t reply_size = 0;
+    int ret = do_transaction(SM_HANDLE, SM_CHECK_SERVICE,
+                             pbuf, psize,
+                             NULL, 0,
+                             reply, sizeof(reply), &reply_size);
+    if (ret < 0) {
+        log_fmt("check '%s': transaction failed", name);
+        return -1;
+    }
+
+    if (reply_size >= 8) {
+        const uint8_t* rp = reply;
+        uint32_t exception = read_uint32(&rp);
+        if (exception != 0) {
+            log_fmt("check '%s': exception %u (service does not exist)", name, exception);
+            return 0;
+        }
+        uint32_t has_binder = read_uint32(&rp);
+        if (has_binder != 0) {
+            log_fmt("check '%s': service already EXISTS", name);
+            return 1;
+        }
+    }
+    log_fmt("check '%s': service not found", name);
+    return 0;
+}
+
 static int register_one_name(const char* name) {
+    int exists = check_service_exists(name);
+    if (exists > 0) {
+        log_fmt("'%s' already registered, skipping", name);
+        return 0;
+    }
+    if (exists < 0) {
+        log_fmt("check failed for '%s', trying registration anyway", name);
+    }
+
     uint8_t pbuf[2048];
     memset(pbuf, 0, sizeof(pbuf));
     uint8_t* p = pbuf;
 
-    write_uint32(&p, 0);  /* strict mode policy */
+    write_uint32(&p, 0);
     write_string16(&p, "android.os.IServiceManager");
     write_string16(&p, name);
 
     uint32_t fbo_offset = (uint32_t)(uintptr_t)(p - pbuf);
 
-    /*
-     * Use legacy flat_binder_object layout for kernel < 5.x compatibility.
-     * NDK r27c's binder.h defines the NEW UAPI (24-byte struct, type=0x73622a85),
-     * but kernel 4.x expects the OLD UAPI (28-byte struct, type=1).
-     * The old layout has an extra __u32 __reserved field after flags.
-     */
+    if (use_new_fbo) {
+        struct flat_binder_object fbo;
+        memset(&fbo, 0, sizeof(fbo));
+        fbo.hdr.type = BINDER_TYPE_BINDER;
+        fbo.flags = 0x7f | FLAT_BINDER_FLAG_ACCEPTS_FDS;
+        fbo.binder = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+        fbo.cookie = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+        if (sizeof(fbo) != 24) {
+            log_fmt("WARNING: flat_binder_object size=%zu (expected 24)", sizeof(fbo));
+        }
+        memcpy(p, &fbo, sizeof(fbo)); p += sizeof(fbo);
+    } else {
 #define BINDER_TYPE_BINDER_LEGACY 1
-#define FBO_FLAG_ACCEPTS_FDS     0x100
-    struct {
-        uint32_t type;
-        uint32_t flags;
-        uint32_t __reserved;
-        binder_uintptr_t binder;
-        binder_uintptr_t cookie;
-    } fbo_legacy;
-    memset(&fbo_legacy, 0, sizeof(fbo_legacy));
-    fbo_legacy.type      = BINDER_TYPE_BINDER_LEGACY;
-    fbo_legacy.flags     = 0x7f | FBO_FLAG_ACCEPTS_FDS;
-    fbo_legacy.binder    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
-    fbo_legacy.cookie    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
-    memcpy(p, &fbo_legacy, sizeof(fbo_legacy)); p += sizeof(fbo_legacy);
+#define FBO_FLAG_ACCEPTS_FDS_LEGACY 0x100
+        struct {
+            uint32_t type;
+            uint32_t flags;
+            uint32_t __reserved;
+            binder_uintptr_t binder;
+            binder_uintptr_t cookie;
+        } fbo_legacy;
+        memset(&fbo_legacy, 0, sizeof(fbo_legacy));
+        fbo_legacy.type      = BINDER_TYPE_BINDER_LEGACY;
+        fbo_legacy.flags     = 0x7f | FBO_FLAG_ACCEPTS_FDS_LEGACY;
+        fbo_legacy.binder    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+        fbo_legacy.cookie    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+        memcpy(p, &fbo_legacy, sizeof(fbo_legacy)); p += sizeof(fbo_legacy);
+    }
 
-    write_uint32(&p, 0);  /* allow_isolated */
-    write_uint32(&p, 0);  /* dump_priority  */
+    write_uint32(&p, 0);
+    write_uint32(&p, 0);
 
     size_t   psize   = (size_t)(p - pbuf);
     uint32_t offsets[1] = { fbo_offset };
@@ -534,6 +543,16 @@ static int register_one_name(const char* name) {
         log_fmt("register '%s': transaction failed", name);
         return -1;
     }
+
+    if (reply_size >= 4) {
+        const uint8_t* rp = reply;
+        uint32_t exception = read_uint32(&rp);
+        if (exception != 0) {
+            log_fmt("register '%s': exception %u", name, exception);
+            return -1;
+        }
+    }
+
     log_fmt("registered '%s' OK", name);
     return 0;
 }
@@ -541,52 +560,37 @@ static int register_one_name(const char* name) {
 static int register_with_sm(void) {
     log_msg("registering with ServiceManager...");
     int success = 0;
-    for (int i = 0; SERVICE_NAMES[i]; i++) {
-        if (register_one_name(SERVICE_NAMES[i]) == 0)
-            success = 1;
+
+    for (int retry = 0; retry < 3 && !success; retry++) {
+        for (int i = 0; SERVICE_NAMES[i]; i++) {
+            if (register_one_name(SERVICE_NAMES[i]) == 0)
+                success = 1;
+        }
+        if (!success && retry < 2) {
+            log_fmt("registration retry %d/2, waiting 2s...", retry + 1);
+            sleep(2);
+        }
     }
+
     if (!success) {
         log_msg("WARNING: failed to register under ANY service name");
+        unlink(REGFILE);
         return -1;
+    }
+
+    FILE* rf = fopen(REGFILE, "w");
+    if (rf) {
+        fprintf(rf, "registered=1\n");
+        fclose(rf);
     }
     return 0;
 }
 
-/* ---- INetworkStatsService transaction codes ---- */
-/*
- * Transaction codes vary between Android versions as the AIDL interface grows.
- * INetworkStatsService.aidl:
- *
- * Android 10-13 (SDK 29-33):
- *   getTotalStats   = 1
- *   getIfaceStats   = 2
- *   forceUpdate     = 3
- *   (more methods follow)
- *
- * Android 14 (SDK 34):
- *   getTotalStats   = 1
- *   getIfaceStats   = 2
- *   forceUpdate     = 3
- *   getIfaceStatsV2 = 4 (new signature)
- *   getTotalStatsV2 = 5
- *
- * Android 15-16 (SDK 35-36):
- *   getTotalStats   = 1
- *   getIfaceStats   = 2
- *   forceUpdate     = 3
- *   getUidStats     = 4
- *
- * However, many ROMs backport changes or reorder methods.
- * To be universal, we handle a wide range and also accept legacy codes.
- * Always return plausible data rather than errors.
- */
-/* Primary codes (most common assignment) */
 #define TX_GET_TOTAL_STATS      1
 #define TX_GET_IFACE_STATS      2
 #define TX_FORCE_UPDATE         3
 #define TX_GET_UID_STATS        4
 
-/* Legacy / alternative assignments */
 #define TX_GET_IFACE_STATS_V2   12
 #define TX_GET_TOTAL_STATS_V2   13
 #define TX_FORCE_UPDATE_V2      14
@@ -609,7 +613,7 @@ static uint64_t pick_stat(const struct net_stats* s, int type) {
 }
 
 static void write_no_exception(uint8_t** buf) {
-    write_uint32(buf, 0); /* EX_NONE */
+    write_uint32(buf, 0);
 }
 
 static void handle_getIfaceStats(const struct binder_transaction_data* tr,
@@ -620,12 +624,9 @@ static void handle_getIfaceStats(const struct binder_transaction_data* tr,
     const uint8_t* pp   = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
     const uint8_t* pend = pp + tr->data_size;
 
-    /* skip strict-mode int32 */
     if (pp + 4 <= pend) pp += 4;
-    /* skip interface descriptor */
     if (pp + 4 <= pend) skip_string16(&pp);
 
-    /* iface name */
     char iface[64];
     strncpy(iface, "wlan0", sizeof(iface));
     if (pp + 4 <= pend) {
@@ -635,7 +636,7 @@ static void handle_getIfaceStats(const struct binder_transaction_data* tr,
                 iface[i] = (char)pp[i * 2];
             }
             iface[name_len] = '\0';
-            pp += (name_len + 1) * 2; /* +1 for null terminator */
+            pp += (name_len + 1) * 2;
             align4_const(&pp);
         }
     }
@@ -658,8 +659,8 @@ static void handle_getTotalStats(const struct binder_transaction_data* tr,
     const uint8_t* pp   = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
     const uint8_t* pend = pp + tr->data_size;
 
-    if (pp + 4 <= pend) pp += 4;              /* strict mode */
-    if (pp + 4 <= pend) skip_string16(&pp);   /* descriptor */
+    if (pp + 4 <= pend) pp += 4;
+    if (pp + 4 <= pend) skip_string16(&pp);
 
     int type = TYPE_RX_BYTES;
     if (pp + 4 <= pend) type = (int)read_uint32(&pp);
@@ -672,26 +673,23 @@ static void handle_getTotalStats(const struct binder_transaction_data* tr,
     *reply_size = (size_t)(rp - reply_buf);
 }
 
-/* Handle querySummaryForDevice or getDeviceSummary — return Bucket-like data.
- * These methods return a Parcelable with multiple fields.
- * We return: status=0 (OK), rxBytes, txBytes, rxPackets, txPackets, uid=0, iface="" */
 static void handle_getDeviceSummary(const struct binder_transaction_data* tr,
                                      uint8_t* reply_buf, size_t* reply_size) {
+    (void)tr;
     uint8_t* rp = reply_buf;
     write_no_exception(&rp);
 
     struct net_stats s;
     read_all_stats(&s);
 
-    /* Write a Bucket-like structure: 6 uint64 + 1 uint32 + empty iface */
-    write_uint64(&rp, 0);              /* status */
-    write_uint64(&rp, s.rxBytes);      /* rxBytes */
-    write_uint64(&rp, s.txBytes);      /* txBytes */
-    write_uint64(&rp, s.rxPackets);    /* rxPackets */
-    write_uint64(&rp, s.txPackets);    /* txPackets */
-    write_uint64(&rp, 0);              /* uid = 0 (aggregate) */
-    write_uint32(&rp, 0);              /* iface tag */
-    write_string16(&rp, "");           /* empty iface name */
+    write_uint64(&rp, 0);
+    write_uint64(&rp, s.rxBytes);
+    write_uint64(&rp, s.txBytes);
+    write_uint64(&rp, s.rxPackets);
+    write_uint64(&rp, s.txPackets);
+    write_uint64(&rp, 0);
+    write_uint32(&rp, 0);
+    write_string16(&rp, "");
 
     *reply_size = (size_t)(rp - reply_buf);
     log_fmt("getDeviceSummary -> rx=%llu tx=%llu",
@@ -717,7 +715,6 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             break;
 
         case TX_GET_UID_STATS:
-            /* Return 0 for all per-UID queries (interface-level only) */
             write_no_exception(&reply_rp);
             write_uint64(&reply_rp, 0);
             reply_size = (size_t)(reply_rp - reply_data);
@@ -732,34 +729,28 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
 
         case TX_PING:
         case TX_PING2:
-            /* isAlive → return true (1) */
             write_no_exception(&reply_rp);
             write_uint32(&reply_rp, 1);
             reply_size = (size_t)(reply_rp - reply_data);
             break;
 
-        case 5:   /* querySummaryForDevice (possible code, AIDL position dependent) */
-        case 6:   /* getDeviceSummary variant */
-        case 7:   /* Another summary method */
+        case 5:
+        case 6:
+        case 7:
         case 8:
             handle_getDeviceSummary(tr, reply_data, &reply_size);
             break;
 
         default:
-            /*
-             * Try to extract a type parameter and return /proc/net/dev data.
-             * Many unrecognized codes are just renamed getTotalStats variants.
-             */
             {
                 const uint8_t* pp   = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
                 const uint8_t* pend = pp + tr->data_size;
                 if (pp + 8 <= pend) {
-                    pp += 4;              /* skip strict mode */
-                    if (pp + 4 <= pend) skip_string16(&pp);   /* skip descriptor */
+                    pp += 4;
+                    if (pp + 4 <= pend) skip_string16(&pp);
                     if (pp + 4 <= pend) {
                         int guessed_type = (int)read_uint32(&pp);
                         if (guessed_type >= 0 && guessed_type <= 3) {
-                            /* Looks like a getTotalStats variant */
                             struct net_stats s;
                             read_all_stats(&s);
                             uint64_t val = pick_stat(&s, guessed_type);
@@ -773,7 +764,6 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
                     }
                 }
             }
-            /* Last resort: return empty OK */
             log_fmt("unhandled code=%u (0x%x) sender_pid=%u, returning empty",
                     (unsigned)tr->code, (unsigned)tr->code, (unsigned)tr->sender_pid);
             write_no_exception(&reply_rp);
@@ -781,7 +771,6 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
             break;
     }
 
-    /* Build BC_REPLY */
     size_t rwbuf_size = 4 + sizeof(struct binder_transaction_data) + reply_size + 64;
     uint8_t* rwbuf = (uint8_t*)calloc(1, rwbuf_size);
     if (!rwbuf) return;
@@ -810,7 +799,18 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
     free(rwbuf);
 }
 
-/* ---- Main event loop ---- */
+static int get_kernel_version(void) {
+    FILE* f = fopen("/proc/version", "r");
+    if (!f) return -1;
+    char line[256];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    fclose(f);
+    int maj = 0, min = 0;
+    if (sscanf(line, "Linux version %d.%d", &maj, &min) >= 2)
+        return maj * 100 + min;
+    return -1;
+}
+
 static void run_event_loop(void) {
     uint8_t* rbuf = (uint8_t*)malloc(BINDER_BUF_SIZE);
     if (!rbuf) { log_msg("FATAL: malloc for event loop buffer"); return; }
@@ -830,7 +830,6 @@ static void run_event_loop(void) {
         if (consumed == 0) {
             idle_count++;
             usleep(5000);
-            /* Periodically update the stats fallback file */
             if ((idle_count % 200) == 0) update_stats_file();
             continue;
         }
@@ -878,7 +877,6 @@ static void run_event_loop(void) {
                         rp += sizeof(binder_uintptr_t) * 2;
                     break;
                 case BR_SPAWN_LOOPER: {
-                    /* Kernel wants another looper thread; we comply inline */
                     uint32_t c = BC_ENTER_LOOPER;
                     send_bc((const uint8_t*)&c, sizeof(c), NULL, 0, NULL);
                     break;
@@ -925,7 +923,6 @@ static void run_event_loop(void) {
                 }
                 default:
                     log_fmt("unknown cmd 0x%x at offset %d", cmd, (int)(rp - 4 - rbuf));
-                    /* Skip 8 bytes of payload and continue */
                     {
                         int skip = 8;
                         const uint8_t* next = rp + skip;
@@ -940,9 +937,9 @@ static void run_event_loop(void) {
     free(rbuf);
 }
 
-/* ---- Signal handler: log and exit cleanly ---- */
 static void sig_handler(int sig) {
     log_fmt("Caught signal %d, exiting", sig);
+    unlink(REGFILE);
     if (binder_map && binder_map != MAP_FAILED)
         munmap(binder_map, BINDER_MMAP_SIZE);
     if (binder_fd >= 0)
@@ -955,6 +952,10 @@ int main(void) {
 
     signal(SIGTERM, sig_handler);
     signal(SIGHUP,  sig_handler);
+    signal(SIGINT,  sig_handler);
+
+    int kv = get_kernel_version();
+    log_fmt("Kernel version: %d.%d", kv / 100, kv % 100);
 
     if (open_binder() < 0) {
         log_msg("FATAL: failed to open binder");
@@ -966,19 +967,16 @@ int main(void) {
         return 1;
     }
 
-    /* Write initial stats file immediately */
     update_stats_file();
 
     if (register_with_sm() < 0) {
         log_msg("WARNING: ServiceManager registration failed; continuing in passive mode");
-        /* Still run the loop - we may still receive transactions if the
-         * service was already registered from a previous run, or if netd
-         * finds us via the stats file. */
     }
 
     run_event_loop();
 
     log_msg("Exiting");
+    unlink(REGFILE);
     if (binder_map && binder_map != MAP_FAILED)
         munmap(binder_map, BINDER_MMAP_SIZE);
     if (binder_fd >= 0)

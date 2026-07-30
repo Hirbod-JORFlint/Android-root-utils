@@ -78,13 +78,14 @@ apply_sepolicy() {
     _log "Applying live SELinux rules..."
     "$MP" --live "allow domain proc_net:file { read open getattr }"               2>/dev/null
     "$MP" --live "allow domain proc_net:dir { read search open }"                 2>/dev/null
+    "$MP" --live "allow domain binder_device:chr_file { read write open ioctl }"  2>/dev/null
+    "$MP" --live "allow domain servicemanager:binder { call transfer }"              2>/dev/null
+    "$MP" --live "allow domain servicemanager:service_manager { find add }"        2>/dev/null
+    "$MP" --live "allow domain netstats_service:service_manager { add }"           2>/dev/null
     "$MP" --live "allow system_server proc_net:file { read open getattr }"        2>/dev/null
     "$MP" --live "allow system_server proc_net:dir { read search open }"          2>/dev/null
     "$MP" --live "allow system_app proc_net:file { read open getattr }"           2>/dev/null
     "$MP" --live "allow platform_app proc_net:file { read open getattr }"         2>/dev/null
-    "$MP" --live "allow domain binder_device:chr_file { read write open ioctl }"  2>/dev/null
-    "$MP" --live "allow domain servicemanager:service_manager { find add }"        2>/dev/null
-    "$MP" --live "allow domain service_manager_service:service_manager { find add }" 2>/dev/null
     "$MP" --live "allow init bpfloader_exec:file { getattr open read execute execute_no_trans }" 2>/dev/null
     "$MP" --live "allow init bpfloader_platform_exec:file { getattr open read execute execute_no_trans }" 2>/dev/null
     "$MP" --live "allow bpfloader bpffs:dir { search read write add_name remove_name create }"   2>/dev/null
@@ -93,6 +94,7 @@ apply_sepolicy() {
     "$MP" --live "allow netd bpffs:dir { search read write add_name remove_name }" 2>/dev/null
     "$MP" --live "allow netd bpffs:file { read write open map getattr }"           2>/dev/null
     "$MP" --live "allow crash_dump bpfloader:process { ptrace }"                  2>/dev/null
+    "$MP" --live "allow * * service_manager { add find }"                         2>/dev/null
     _log "Live SELinux rules applied"
 }
 
@@ -117,7 +119,7 @@ start_nproxy() {
     fi
 
     if grep -q "FATAL: failed to open binder" "$LOG" 2>/dev/null; then
-        _log "Binder not available yet, will retry in Phase 2/6"
+        _log "Binder not available yet, will retry"
         return 2
     fi
 
@@ -132,6 +134,12 @@ start_nproxy() {
         return 0
     fi
     _log "Proxy failed both attempts"
+    return 1
+}
+
+check_nproxy_registered() {
+    grep -q "registered '" "$LOG" 2>/dev/null && return 0
+    [ -f /data/local/tmp/netproxy_registered ] && return 0
     return 1
 }
 
@@ -168,12 +176,14 @@ for m in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_
     [ -e "$p" ] && _log "  $m: present" || _log "  $m: absent"
 done
 
+STUB_BPF=0
 if stub_bpfloader_detected; then
     _log "*** bpfloader STUB detected (mainline_done present, 0 maps) ***"
+    STUB_BPF=1
 fi
 
 _log "--- SELinux denials (relevant) ---"
-dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'bpf|netd|bpfloader|proc_net' | tail -10 | \
+dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'bpf|netd|bpfloader|proc_net|service_manager|netstats' | tail -15 | \
     while IFS= read -r line; do _log "  DENIED: $line"; done
 
 BPF_RESTORE=0
@@ -182,11 +192,7 @@ elif [ "$KMAJOR" -eq 4 ] && [ "$KMINOR" -ge 9 ]; then BPF_RESTORE=1
 fi
 _log "BPF restore eligible: $BPF_RESTORE (kernel $KMAJOR.$KMINOR)"
 
-if [ "$BPF_RESTORE" -eq 0 ]; then
-    _log "BPF not possible on kernel $KMAJOR.$KMINOR, using netproxy fallback"
-fi
-
-# Phase 1: Start netproxy EARLY so it can register before SystemUI re-queries
+# Phase 1: Start netproxy early
 _log "--- Phase 1: Early Netproxy ---"
 RAW_BIN=$(find_netproxy)
 if [ -n "$RAW_BIN" ]; then
@@ -198,13 +204,14 @@ else
     _log "netproxy binary not found!"
 fi
 
-# Phase 2: BPF Repair
+# Phase 2: BPF Repair (skip if stub bpfloader known or kernel too old)
 BPF_STATS_OK=0
 if bpf_stats_ready; then
     BPF_STATS_OK=1
     _log "--- Phase 2: BPF maps already present ---"
-elif [ "$BPF_RESTORE" -eq 0 ]; then
-    _log "--- Phase 2: BPF not capable, skipping ---"
+elif [ "$BPF_RESTORE" -eq 0 ] || [ "$STUB_BPF" -eq 1 ]; then
+    _log "--- Phase 2: BPF not capable or stub bpfloader, skipping restoration ---"
+    _log "  Relying on netproxy fallback"
 else
     _log "--- Phase 2: BPF Repair ---"
 
@@ -239,7 +246,15 @@ else
         sleep 3
 
         NEW=$(count_bpf_maps)
-        _log "  BPF maps after attempt $ATTEMPT: $NEW (was: $MAP_COUNT)"
+        _log "  BPF maps after attempt $ATTEMPT: $NEW"
+
+        # Check if stub bpfloader regenerated mainline_done
+        if stub_bpfloader_detected; then
+            _log "  *** Stub bpfloader detected! mainline_done reappeared with 0 maps."
+            _log "  *** Stopping BPF restoration attempts."
+            STUB_BPF=1
+            break
+        fi
     done
 
     if bpf_stats_ready; then
@@ -248,7 +263,7 @@ else
     else
         _log "BPF Repair FAILED after $ATTEMPT attempts"
         if stub_bpfloader_detected; then
-            _log "  Cause: bpfloader is a STUB (patched to skip map creation)"
+            _log "  Cause: bpfloader is a STUB (creates only mainline_done)"
             _log "  Will rely on netproxy fallback"
         fi
         ls -la "$BPF_NETD/" 2>/dev/null | while IFS= read -r l; do _log "  $l"; done
@@ -310,58 +325,64 @@ cmd netstats force-refresh 2>/dev/null && _log "netstats force-refresh: OK" \
     || _log "netstats force-refresh: not available"
 cmd netstatscore force-refresh 2>/dev/null || true
 
-# Phase 6: Ensure netproxy is running
-if [ "$BPF_STATS_OK" -eq 0 ]; then
-    _log "--- Phase 6: Netproxy Fallback Check ---"
+# Phase 6: Ensure netproxy is running and registered
+_log "--- Phase 6: Netproxy Verification ---"
 
-    apply_sepolicy
+apply_sepolicy
 
-    chmod 0644 /proc/net/dev 2>/dev/null
-    chmod 0644 /proc/self/net/dev 2>/dev/null
+chmod 0644 /proc/net/dev 2>/dev/null
+chmod 0644 /proc/self/net/dev 2>/dev/null
 
-    if [ -z "$NPROXY_BIN" ]; then
-        RAW_BIN=$(find_netproxy)
-        if [ -n "$RAW_BIN" ]; then
-            NPROXY_BIN=$(select_arch_binary "$RAW_BIN")
-            [ -z "$NPROXY_BIN" ] && NPROXY_BIN="$RAW_BIN"
-        fi
+if [ -z "$NPROXY_BIN" ]; then
+    RAW_BIN=$(find_netproxy)
+    if [ -n "$RAW_BIN" ]; then
+        NPROXY_BIN=$(select_arch_binary "$RAW_BIN")
+        [ -z "$NPROXY_BIN" ] && NPROXY_BIN="$RAW_BIN"
     fi
-
-    if [ -n "$NPROXY_BIN" ]; then
-        if [ -n "$NPROXY_PID" ] && ! kill -0 "$NPROXY_PID" 2>/dev/null; then
-            NPROXY_PID=""
-        fi
-        if [ -z "$NPROXY_PID" ]; then
-            _log "Starting netproxy (BPF fallback)..."
-            NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
-        fi
-
-        # Check if proxy registered successfully
-        if [ -n "$NPROXY_PID" ]; then
-            sleep 2
-            if grep -q "registered '" "$LOG" 2>/dev/null; then
-                _log "Netproxy registered in ServiceManager"
-            elif grep -q "WARNING:" "$LOG" 2>/dev/null; then
-                _log "Netproxy registration failed (continuing anyway)"
-            fi
-        fi
-    else
-        _log "FATAL: netproxy binary not found"
-    fi
-else
-    _log "--- Phase 6: BPF working, proxy not needed ---"
 fi
 
-# Phase 7: Restart SystemUI
-_log "--- Phase 7: Restart SystemUI ---"
-sleep 3
-killall -9 com.android.systemui 2>/dev/null \
-    || pkill -9 -f com.android.systemui 2>/dev/null \
-    || am force-stop com.android.systemui 2>/dev/null
-_log "SystemUI killed"
-sleep 8
-SYSUI_PID=$(pidof com.android.systemui 2>/dev/null)
-_log "SystemUI running as pid=$SYSUI_PID"
+NPROXY_REGISTERED=0
+if [ -n "$NPROXY_BIN" ]; then
+    if [ -n "$NPROXY_PID" ] && ! kill -0 "$NPROXY_PID" 2>/dev/null; then
+        NPROXY_PID=""
+    fi
+
+    if [ -z "$NPROXY_PID" ]; then
+        _log "Starting netproxy..."
+        NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
+    fi
+
+    if [ -n "$NPROXY_PID" ]; then
+        WAIT_REG=0
+        while [ "$WAIT_REG" -lt 15 ]; do
+            sleep 1; WAIT_REG=$((WAIT_REG+1))
+            if check_nproxy_registered; then
+                NPROXY_REGISTERED=1
+                _log "Netproxy registered successfully (after ${WAIT_REG}s)"
+                break
+            fi
+        done
+        if [ "$NPROXY_REGISTERED" -eq 0 ]; then
+            _log "Netproxy NOT registered after ${WAIT_REG}s"
+            _log "  Check logs: grep 'WARNING\|FATAL\|failed' $LOG"
+        fi
+    fi
+else
+    _log "FATAL: netproxy binary not found"
+fi
+
+# Phase 7: Restart SystemUI (to pick up our registered service)
+if [ "$NPROXY_REGISTERED" -eq 1 ] || [ "$BPF_STATS_OK" -eq 1 ]; then
+    _log "--- Phase 7: Restart SystemUI ---"
+    sleep 3
+    am force-stop com.android.systemui 2>/dev/null
+    _log "SystemUI killed"
+    sleep 8
+    SYSUI_PID=$(pidof com.android.systemui 2>/dev/null)
+    _log "SystemUI running as pid=$SYSUI_PID"
+else
+    _log "--- Phase 7: Skipping SystemUI restart (no stats mechanism active) ---"
+fi
 
 sleep 5
 
@@ -369,13 +390,16 @@ sleep 5
 _log "============================================"
 _log "SUMMARY:"
 if [ "$BPF_STATS_OK" -eq 1 ]; then
-    _log "  BPF maps restored per-UID stats active"
-elif [ -n "$NPROXY_PID" ] && kill -0 "$NPROXY_PID" 2>/dev/null; then
-    _log "  Netproxy active (PID $NPROXY_PID) via /proc/net/dev"
-elif [ "$QTAGUID_OK" -eq 1 ]; then
-    _log "  xt_qtaguid active"
-else
-    _log "  No BPF/proxy/qtaguid only interface-level stats"
+    _log "  BPF maps restored: per-UID stats active"
+fi
+if [ "$NPROXY_REGISTERED" -eq 1 ]; then
+    _log "  Netproxy registered: interface-level stats active"
+fi
+if [ "$QTAGUID_OK" -eq 1 ]; then
+    _log "  xt_qtaguid available: legacy stats active"
+fi
+if [ "$BPF_STATS_OK" -eq 0 ] && [ "$NPROXY_REGISTERED" -eq 0 ] && [ "$QTAGUID_OK" -eq 0 ]; then
+    _log "  No stats mechanism active"
 fi
 _log "============================================"
 _log "=== service.sh complete ==="
@@ -399,7 +423,7 @@ while true; do
         && _log "[WD-$WD] Restarted netd"
 
     if [ "$BPF_STATS_OK" -eq 1 ] && ! bpf_stats_ready; then
-        _log "[WD-$WD] BPF maps lost attempting restore..."
+        _log "[WD-$WD] BPF maps lost, attempting restore..."
         [ -d "$BPF_NETD/mainline_done" ] && rm -rf "$BPF_NETD/mainline_done" 2>/dev/null
         stop bpfloader 2>/dev/null; sleep 1; start bpfloader 2>/dev/null
         sleep 10
@@ -409,24 +433,34 @@ while true; do
         fi
     fi
 
-    if [ "$BPF_STATS_OK" -eq 0 ] && [ -n "$NPROXY_BIN" ]; then
+    if [ -n "$NPROXY_BIN" ]; then
         if ! pidof netproxy > /dev/null 2>&1; then
-            _log "[WD-$WD] Proxy died restarting..."
+            _log "[WD-$WD] Proxy died, restarting..."
             NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
             if [ -n "$NPROXY_PID" ]; then
-                # Restart SystemUI to pick up new service reference
-                killall -9 com.android.systemui 2>/dev/null || true
+                WAIT_REG=0
+                while [ "$WAIT_REG" -lt 10 ]; do
+                    sleep 1; WAIT_REG=$((WAIT_REG+1))
+                    if check_nproxy_registered; break; fi
+                done
+                if check_nproxy_registered; then
+                    am force-stop com.android.systemui 2>/dev/null || true
+                fi
             fi
+        elif ! check_nproxy_registered; then
+            _log "[WD-$WD] Proxy running but not registered, restarting..."
+            killall -9 netproxy 2>/dev/null || true
+            sleep 1
+            NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
         fi
     fi
 
-    # BPF stub bypass: if mainline_done exists but no maps, keep deleting it
     if stub_bpfloader_detected; then
         rm -rf "$BPF_NETD/mainline_done" 2>/dev/null
         _log "[WD-$WD] Deleted stale mainline_done from stub bpfloader"
     fi
 
     if [ "$((WD % 12))" -eq 0 ]; then
-        _log "[WD-$WD] maps=$(count_bpf_maps) proxy=$(pidof netproxy 2>/dev/null || echo none) netd=$NETD"
+        _log "[WD-$WD] maps=$(count_bpf_maps) proxy=$(pidof netproxy 2>/dev/null || echo none) registered=$(check_nproxy_registered && echo yes || echo no) netd=$NETD"
     fi
 done

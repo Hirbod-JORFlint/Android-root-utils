@@ -2,7 +2,7 @@
 
 ui_print ""
 ui_print "  ╔══════════════════════════════════════════╗"
-ui_print "  ║      Network Stats Fix for GSI v11      ║"
+ui_print "  ║      Network Stats Fix for GSI v12      ║"
 ui_print "  ║  Universal traffic indicator fix        ║"
 ui_print "  ╚══════════════════════════════════════════╝"
 ui_print ""
@@ -44,7 +44,6 @@ ui_print "[*] ROM: $ROM"
 APEX=$(getprop apexd.state 2>/dev/null || echo "unknown")
 ui_print "[*] APEX state: $APEX"
 
-# Check if tethering APEX exists (required for netbpfload)
 if [ -f /apex/com.android.tethering/apex_manifest.json ] || [ -d /apex/com.android.tethering ]; then
     ui_print "[*] Tethering APEX: present"
 else

@@ -38,7 +38,20 @@ fi
 
 _log "BPF restore eligible: $BPF_RESTORE (kernel $KMAJOR.$KMINOR)"
 
-if [ "$BPF_RESTORE" -eq 1 ]; then
+# Detect stub bpfloader early: if mainline_done exists but no maps, it's a stub
+STUB_BPF=0
+if [ -d "$BPF_NETD/mainline_done" ]; then
+    MAP_COUNT=0
+    for MAP_NAME in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B; do
+        [ -e "$BPF_NETD/map_netd_${MAP_NAME}" ] && MAP_COUNT=$((MAP_COUNT + 1))
+    done
+    if [ "$MAP_COUNT" -eq 0 ]; then
+        STUB_BPF=1
+        _log "*** Stub bpfloader detected early! (mainline_done present, 0 maps) ***"
+    fi
+fi
+
+if [ "$BPF_RESTORE" -eq 1 ] && [ "$STUB_BPF" -eq 0 ]; then
     if [ -d "$BPF_NETD/mainline_done" ]; then
         rm -rf "$BPF_NETD/mainline_done" 2>/dev/null \
             && _log "Deleted mainline_done marker" \
@@ -52,10 +65,9 @@ if [ "$BPF_RESTORE" -eq 1 ]; then
         resetprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null \
         || resetprop_phh ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null \
         || setprop ro.bpf.kver_override "$CORRECT_KVER" 2>/dev/null
-        _log "Set ro.bpf.kver_override=$CORRECT_KVER"
     fi
 
-    resetprop ro.bpf.enabled 1 2>/dev/null || setprop ro.bpf.enabled 1 2>/dev/null
+    resetprop ro.bpf.enabled 1 2>/dev/null || true
     resetprop persist.net.bpf.enable 1 2>/dev/null || true
     resetprop ro.kernel.ebpf.supported 1 2>/dev/null || true
 
@@ -63,29 +75,26 @@ if [ "$BPF_RESTORE" -eq 1 ]; then
         echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null \
             && _log "BPF JIT enabled" || _log "BPF JIT sysctl not writable"
     fi
-
-    BPFL_STATUS=$(getprop init.svc.bpfloader 2>/dev/null)
-    if [ "$BPFL_STATUS" = "stopped" ] || [ "$BPFL_STATUS" = "restarting" ]; then
-        _log "Triggering early bpfloader restart (was: $BPFL_STATUS)"
-        setprop ctl.restart bpfloader 2>/dev/null || start bpfloader 2>/dev/null || true
-    else
-        _log "bpfloader status: ${BPFL_STATUS:-not started} (deferring to service.sh)"
-    fi
-
-    if [ "$KMAJOR" -lt 5 ]; then
-        for MP in \
-            /vendor/lib/modules/xt_qtaguid.ko \
-            /system/lib/modules/xt_qtaguid.ko \
-            /vendor_dlkm/lib/modules/xt_qtaguid.ko \
-            /system_dlkm/lib/modules/xt_qtaguid.ko; do
-            [ -f "$MP" ] && insmod "$MP" 2>/dev/null \
-                && _log "Loaded xt_qtaguid from $MP" && break
-        done
-        [ ! -e /dev/xt_qtaguid ] && mknod /dev/xt_qtaguid c 10 229 2>/dev/null
-        chmod 0666 /dev/xt_qtaguid 2>/dev/null
-    fi
 else
-    _log "Kernel $KMAJOR.$KMINOR < 4.9: skipping BPF ops"
+    _log "Skipping BPF restoration (eligible=$BPF_RESTORE stub=$STUB_BPF)"
+fi
+
+BPFL_STATUS=$(getprop init.svc.bpfloader 2>/dev/null)
+if [ "$BPFL_STATUS" = "stopped" ] && [ "$STUB_BPF" -eq 0 ]; then
+    _log "bpfloader: stopped, can restart in service.sh"
+fi
+
+if [ "$KMAJOR" -lt 5 ]; then
+    for MP in \
+        /vendor/lib/modules/xt_qtaguid.ko \
+        /system/lib/modules/xt_qtaguid.ko \
+        /vendor_dlkm/lib/modules/xt_qtaguid.ko \
+        /system_dlkm/lib/modules/xt_qtaguid.ko; do
+        [ -f "$MP" ] && insmod "$MP" 2>/dev/null \
+            && _log "Loaded xt_qtaguid from $MP" && break
+    done
+    [ ! -e /dev/xt_qtaguid ] && mknod /dev/xt_qtaguid c 10 229 2>/dev/null
+    chmod 0666 /dev/xt_qtaguid 2>/dev/null
 fi
 
 MAP_COUNT=0
