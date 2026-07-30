@@ -2,7 +2,8 @@
 allow * proc_net:file { read open getattr };
 allow * proc_net:dir { read search open };
 allow * binder_device:chr_file { read write open ioctl };
-allow * binder:service_manager { find add };
+allow * servicemanager:service_manager { find add };
+allow * service_manager_service:service_manager { find add };
 allow * netd:fd use;
 allow * netd_socket:sock_file write;
 allow * sysfs_bpf:file { read open getattr };
@@ -73,7 +74,8 @@ allow platform_app socket_device:sock_file { read write open };
 allow magisk proc_net:file { read open getattr };
 allow magisk proc_net:dir { read search open };
 allow magisk binder_device:chr_file { read write open ioctl };
-allow magisk binder:service_manager { find add };
+allow magisk servicemanager:service_manager { find add };
+allow magisk service_manager_service:service_manager { find add };
 allow magisk sysfs_bpf:file { read open getattr };
 allow magisk sysfs_bpf:dir { read search open };
 

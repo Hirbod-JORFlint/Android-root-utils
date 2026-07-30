@@ -83,6 +83,8 @@ apply_sepolicy() {
     "$MP" --live "allow system_app proc_net:file { read open getattr }"           2>/dev/null
     "$MP" --live "allow platform_app proc_net:file { read open getattr }"         2>/dev/null
     "$MP" --live "allow domain binder_device:chr_file { read write open ioctl }"  2>/dev/null
+    "$MP" --live "allow domain servicemanager:service_manager { find add }"        2>/dev/null
+    "$MP" --live "allow domain service_manager_service:service_manager { find add }" 2>/dev/null
     "$MP" --live "allow init bpfloader_exec:file { getattr open read execute execute_no_trans }" 2>/dev/null
     "$MP" --live "allow init bpfloader_platform_exec:file { getattr open read execute execute_no_trans }" 2>/dev/null
     "$MP" --live "allow bpfloader bpffs:dir { search read write add_name remove_name create }"   2>/dev/null

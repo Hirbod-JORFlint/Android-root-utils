@@ -496,13 +496,27 @@ static int register_one_name(const char* name) {
 
     uint32_t fbo_offset = (uint32_t)(uintptr_t)(p - pbuf);
 
-    struct flat_binder_object fbo;
-    memset(&fbo, 0, sizeof(fbo));
-    fbo.hdr.type = BINDER_TYPE_BINDER;
-    fbo.flags    = 0x7f | FLAT_BINDER_FLAG_ACCEPTS_FDS;
-    fbo.binder   = (binder_uintptr_t)(uintptr_t)binder_local_obj;
-    fbo.cookie   = (binder_uintptr_t)(uintptr_t)binder_local_obj;
-    memcpy(p, &fbo, sizeof(fbo)); p += sizeof(fbo);
+    /*
+     * Use legacy flat_binder_object layout for kernel < 5.x compatibility.
+     * NDK r27c's binder.h defines the NEW UAPI (24-byte struct, type=0x73622a85),
+     * but kernel 4.x expects the OLD UAPI (28-byte struct, type=1).
+     * The old layout has an extra __u32 __reserved field after flags.
+     */
+#define BINDER_TYPE_BINDER_LEGACY 1
+#define FBO_FLAG_ACCEPTS_FDS     0x100
+    struct {
+        uint32_t type;
+        uint32_t flags;
+        uint32_t __reserved;
+        binder_uintptr_t binder;
+        binder_uintptr_t cookie;
+    } fbo_legacy;
+    memset(&fbo_legacy, 0, sizeof(fbo_legacy));
+    fbo_legacy.type      = BINDER_TYPE_BINDER_LEGACY;
+    fbo_legacy.flags     = 0x7f | FBO_FLAG_ACCEPTS_FDS;
+    fbo_legacy.binder    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+    fbo_legacy.cookie    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+    memcpy(p, &fbo_legacy, sizeof(fbo_legacy)); p += sizeof(fbo_legacy);
 
     write_uint32(&p, 0);  /* allow_isolated */
     write_uint32(&p, 0);  /* dump_priority  */

@@ -82,7 +82,8 @@ if [ -n "$MAGISKPOLICY" ]; then
     "$MAGISKPOLICY" --live "allow domain proc_net:file { read open getattr }" 2>/dev/null
     "$MAGISKPOLICY" --live "allow domain proc_net:dir { read search open }" 2>/dev/null
     "$MAGISKPOLICY" --live "allow domain binder_device:chr_file { read write open ioctl }" 2>/dev/null
-    "$MAGISKPOLICY" --live "allow domain binder:service_manager { find add }" 2>/dev/null
+    "$MAGISKPOLICY" --live "allow domain servicemanager:service_manager { find add }" 2>/dev/null
+    "$MAGISKPOLICY" --live "allow domain service_manager_service:service_manager { find add }" 2>/dev/null
     "$MAGISKPOLICY" --live "allow domain netd:fd use" 2>/dev/null
     "$MAGISKPOLICY" --live "allow system_server proc_net:file { read open getattr }" 2>/dev/null
     "$MAGISKPOLICY" --live "allow system_server proc_net:dir { read search open }" 2>/dev/null
