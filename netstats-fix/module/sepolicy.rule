@@ -6,6 +6,8 @@ allow * * service_manager { add find };
 # === netproxy (all contexts) permissions ===
 allow * proc_net:file { read open getattr };
 allow * proc_net:dir { read search open };
+allow * proc_net_dev:file { read open getattr };
+allow * proc_net_dev:dir { read search open };
 allow * binder_device:chr_file { read write open ioctl };
 allow * servicemanager:binder { call transfer };
 allow * servicemanager:service_manager { find add };
@@ -17,7 +19,7 @@ allow * sysfs_bpf:dir { read search open };
 allow * bpffs:file { read open getattr map };
 allow * bpffs:dir { read search open };
 
-# === SystemUI / system_app reading /proc/net/dev ===
+# === proc_net access for all relevant domains ===
 allow system_app proc_net:file { read open getattr };
 allow system_app proc_net:dir { read search open };
 allow platform_app proc_net:file { read open getattr };
@@ -26,6 +28,22 @@ allow system_server proc_net:file { read open getattr };
 allow system_server proc_net:dir { read search open };
 allow system_background proc_net:file { read open getattr };
 allow system_background proc_net:dir { read search open };
+allow untrusted_app proc_net:file { read open getattr };
+allow untrusted_app proc_net:dir { read search open };
+allow nfc proc_net:file { read open getattr };
+allow nfc proc_net:dir { read search open };
+allow radio proc_net:file { read open getattr };
+allow radio proc_net:dir { read search open };
+allow bluetooth proc_net:file { read open getattr };
+allow bluetooth proc_net:dir { read search open };
+
+# === sysfs_bpf access for all domains ===
+allow system_app sysfs_bpf:file { read open getattr };
+allow system_app sysfs_bpf:dir { read search open };
+allow platform_app sysfs_bpf:file { read open getattr };
+allow platform_app sysfs_bpf:dir { read search open };
+allow system_server sysfs_bpf:file { read open getattr };
+allow system_server sysfs_bpf:dir { read search open };
 
 # === bpfloader execution (all possible contexts) ===
 allow init bpfloader_exec:file { getattr open read execute execute_no_trans };
@@ -37,7 +55,7 @@ allow init debug_ramdisk_file:file { getattr open read execute execute_no_trans 
 allow init mnt_expand_file:file { getattr open read execute execute_no_trans };
 allow init apex_data_file:file { getattr open read execute execute_no_trans };
 
-# === bpfloader SELinux domain permissions ===
+# === bpfloader domain permissions ===
 allow bpfloader self:capability { sys_ptrace sys_admin net_admin };
 allow bpfloader self:capability2 { sys_ptrace sys_admin };
 allow bpfloader kernel:system module_request;
@@ -61,7 +79,7 @@ allow bpfloader apex_file:file { getattr open read execute execute_no_trans };
 allow bpfloader apex_exec:file { getattr open read execute execute_no_trans };
 allow bpfloader mnt_expand_file:file { getattr open read execute execute_no_trans };
 
-# === netd permissions for BPF maps ===
+# === netd permissions ===
 allow netd self:capability { sys_admin net_admin };
 allow netd kernel:system module_request;
 allow netd bpffs:dir { search read write add_name remove_name create rmdir };
@@ -70,7 +88,7 @@ allow netd bpffs:lnk_file { read open getattr };
 allow netd proc_net:file { read open getattr };
 allow netd proc_net:dir { search read };
 
-# === system_server permissions for BPF/proc_net ===
+# === system_server permissions ===
 allow system_server self:capability { sys_admin };
 allow system_server bpffs:dir { read search open };
 allow system_server bpffs:file { read open getattr map };
@@ -106,7 +124,26 @@ allow dumpstate bpfloader:process { ptrace };
 # === Shell / ADB ===
 allow shell proc_net:file { read open getattr };
 allow shell proc_net:dir { read search open };
+allow shell binder_device:chr_file { read write open ioctl };
+
+# === KernelSU / APatch contexts ===
+allow ksud proc_net:file { read open getattr };
+allow ksud proc_net:dir { read search open };
+allow ksud binder_device:chr_file { read write open ioctl };
+allow apd proc_net:file { read open getattr };
+allow apd proc_net:dir { read search open };
+allow apd binder_device:chr_file { read write open ioctl };
+allow mgsk proc_net:file { read open getattr };
+allow mgsk proc_net:dir { read search open };
 
 # === Allow all domains to read /proc/net/dev (broad but safe) ===
 allow domain proc_net:file { read open getattr };
 allow domain proc_net:dir { read search open };
+
+# === Allow /data/misc/netstats access ===
+allow system_app netstats_data_file:file { read write open getattr };
+allow system_app netstats_data_file:dir { search read write add_name create };
+allow system_server netstats_data_file:file { read write open getattr };
+allow system_server netstats_data_file:dir { search read write add_name create };
+allow platform_app netstats_data_file:file { read open getattr };
+allow platform_app netstats_data_file:dir { search read };

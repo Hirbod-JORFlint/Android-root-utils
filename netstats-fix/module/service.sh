@@ -226,7 +226,8 @@ write_netstats_fallback() {
 
     # Read current interface stats from /proc/net/dev
     local total_rx=0 total_tx=0 total_rxp=0 total_txp=0
-    local iface_list=""
+    local first_iface=""
+    local entry_lines=""
 
     if [ -f /proc/net/dev ]; then
         while IFS= read -r line; do
@@ -237,7 +238,6 @@ write_netstats_fallback() {
                 eth*|wlan*|rmnet*|p2p*|tun*|veth*)
                     ;;
                 *)
-                    # Skip unknown interfaces
                     continue
                     ;;
             esac
@@ -253,16 +253,18 @@ write_netstats_fallback() {
             total_rxp=$((total_rxp + ${rxpackets:-0}))
             total_txp=$((total_txp + ${txpackets:-0}))
 
-            iface_list="$iface_list $iface"
+            [ -z "$first_iface" ] && first_iface="$iface"
+            entry_lines="${entry_lines}<st if=\"$iface\" dev=\"$iface\" uid=\"-1\" tag=\"0x0\" set=\"default\" rb=\"${rxbytes:-0}\" rp=\"${rxpackets:-0}\" tb=\"${txbytes:-0}\" tp=\"${txpackets:-0}\" />"$'\n'
         done < /proc/net/dev
     fi
+
+    [ -z "$first_iface" ] && first_iface="wlan0"
 
     # Write dev stats XML
     cat > "$STATSFILE_DIR/netstats_dev.xml" <<DEVXML
 <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
 <stats devDetail="true">
-<st if="$iface_list" dev="wlan0" uid="-1" tag="0x0" set="default" rb="$total_rx" rp="$total_rxp" tb="$total_tx" tp="$total_txp" />
-</stats>
+${entry_lines}</stats>
 DEVXML
 
     # Write UID stats XML (empty - no per-UID data available)
@@ -277,7 +279,9 @@ UIDXML
     _log "Wrote netstats fallback (rx=$total_rx tx=$total_tx)"
 }
 
-_log "=== service.sh started ==="
+_log "============================================"
+_log "  service.sh v14 - started"
+_log "============================================"
 
 WAIT=0
 while [ "$(getprop sys.boot_completed 2>/dev/null)" != "1" ] && [ "$WAIT" -lt 180 ]; do

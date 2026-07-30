@@ -1,6 +1,6 @@
 id=netstats-fix-lite
 name=Network Stats Fix (Proxy Only - Lite)
-version=v13-lite
-versionCode=13
+version=v14-lite
+versionCode=14
 author=Hirbod-JORFlint
-description=Lightweight native binder proxy fix for broken traffic indicator. No BPF restoration. Safe for devices where BPF causes 'no internet'. Reads /proc/net/dev directly via binder interception. Dual check strategy for broader compatibility. Comprehensive SELinux policy. SystemUI restart only on successful registration.
+description=Lightweight fix for broken traffic indicator. No BPF restoration - safe for devices where BPF causes 'no internet'. Native binder proxy v6.0 with AIDL metadata support, netstats XML file injection to /data/misc/netstats/, background stats updater, comprehensive SELinux policy. Handles all ROM variants. Extensive logging for debugging.
