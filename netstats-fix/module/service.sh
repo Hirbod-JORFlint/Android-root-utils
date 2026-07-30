@@ -307,6 +307,15 @@ _log "restricted_networking_mode: $(settings get global restricted_networking_mo
 _log "bpfloader: $(getprop init.svc.bpfloader 2>/dev/null)"
 _log "netd: $(getprop init.svc.netd 2>/dev/null)"
 
+_log "Binder devices:"
+for dev in /dev/binder /dev/vndbinder /dev/hwbinder; do
+    if [ -e "$dev" ]; then
+        _log "  $dev: EXISTS ($(ls -la "$dev" 2>/dev/null))"
+    else
+        _log "  $dev: NOT FOUND"
+    fi
+done
+
 MAP_COUNT=$(count_bpf_maps)
 _log "BPF maps present: $MAP_COUNT"
 for m in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B; do
@@ -323,6 +332,9 @@ fi
 _log "--- SELinux denials (relevant) ---"
 dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'bpf|netd|bpfloader|proc_net|service_manager|netstats' | tail -15 | \
     while IFS= read -r line; do _log "  DENIED: $line"; done
+
+_log "ServiceManager messages:"
+dmesg 2>/dev/null | grep -iE 'service_manager|binder:' | tail -10 | while IFS= read -r l; do _log "  SM: $l"; done
 
 BPF_RESTORE=0
 if   [ "$KMAJOR" -gt 4 ]; then BPF_RESTORE=1
@@ -493,26 +505,56 @@ if [ -n "$NPROXY_BIN" ]; then
     fi
 
     if [ -n "$NPROXY_PID" ]; then
-        # Exponential backoff wait for registration
+        # Exponential backoff wait for registration with log monitoring
         WAIT_REG=0
         BACKOFF=2
+        LAST_LOG_LINES=$(wc -l < "$LOG" 2>/dev/null || echo 0)
         while [ "$WAIT_REG" -lt 30 ]; do
             sleep $BACKOFF; WAIT_REG=$((WAIT_REG + BACKOFF))
+
+            # Check if proxy died
+            if ! kill -0 "$NPROXY_PID" 2>/dev/null; then
+                _log "Proxy died at ${WAIT_REG}s, restarting..."
+                tail -20 "$LOG" 2>/dev/null | while IFS= read -r l; do _log "  LAST: $l"; done
+                NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
+                if [ -z "$NPROXY_PID" ]; then
+                    _log "  Could not restart proxy"
+                    break
+                fi
+            fi
+
             if check_nproxy_registered; then
                 NPROXY_REGISTERED=1
-                _log "Netproxy registered successfully (after ${WAIT_REG}s)"
+                _log "*** REGISTERED (after ${WAIT_REG}s) ***"
+                _log "Registration context:"
+                grep -i "registered\|REGISTERED\|addService\|binder opened" "$LOG" 2>/dev/null | tail -10 | while IFS= read -r l; do _log "  $l"; done
                 break
             fi
+
+            # Show netproxy log snippets periodically
+            NEW_LINES=$(($(wc -l < "$LOG" 2>/dev/null || echo 0) - LAST_LOG_LINES))
+            if [ "$NEW_LINES" -gt 0 ]; then
+                tail -$((NEW_LINES > 15 ? 15 : NEW_LINES)) "$LOG" 2>/dev/null | grep -E "ERROR|WARNING|REGISTER|FAIL|opened|ioctl|addService|BR_" | while IFS= read -r l; do _log "  NP: $l"; done
+            fi
+            LAST_LOG_LINES=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+
             # Increase backoff up to max 5s
             BACKOFF=$((BACKOFF + 1))
             [ "$BACKOFF" -gt 5 ] && BACKOFF=5
 
-            # Re-apply sepolicy periodically
+            # Re-apply sepolicy and check denials periodically
             [ "$((WAIT_REG % 10))" -eq 0 ] && apply_sepolicy 2>/dev/null
+            [ "$((WAIT_REG % 12))" -eq 0 ] && {
+                dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'service_manager|servicemanager|binder|proc_net' | tail -5 | while IFS= read -r l; do _log "  DENIAL: $l"; done
+                dmesg 2>/dev/null | grep -iE 'service_manager.*netstats|netstats.*service' | tail -5 | while IFS= read -r l; do _log "  SM: $l"; done
+            }
+
+            _log "Registration: ${WAIT_REG}s, proxy=$(pidof netproxy 2>/dev/null || echo dead), log_lines=$(wc -l < "$LOG" 2>/dev/null || echo ?)"
         done
         if [ "$NPROXY_REGISTERED" -eq 0 ]; then
             _log "Netproxy NOT registered after ${WAIT_REG}s"
             _log "  Check logs: grep 'WARNING\|FATAL\|failed' $LOG"
+            grep -i "WARNING\|ERROR\|FAILED\|denied\|BR_" "$LOG" 2>/dev/null | tail -20 | while IFS= read -r l; do _log "  $l"; done
         fi
     fi
 else
@@ -541,6 +583,26 @@ fi
 
 sleep 5
 
+# Phase 7b: Netproxy log analysis
+_log "--- Phase 7b: Netproxy Log Analysis ---"
+NP_ERRORS=$(grep -ciE "ERROR|FATAL|FAILED|denied|WARNING" "$LOG" 2>/dev/null || echo 0)
+NP_REG=$(grep -c "REGISTERED\|registered '" "$LOG" 2>/dev/null || echo 0)
+NP_BINDER=$(grep -c "binder opened" "$LOG" 2>/dev/null || echo 0)
+NP_TXNS=$(grep -c ">>> TX" "$LOG" 2>/dev/null || echo 0)
+NP_REPLIES=$(grep -c "<<< REPLY\|REPLY SENT" "$LOG" 2>/dev/null || echo 0)
+_log "  Errors/warnings: $NP_ERRORS"
+_log "  Registrations: $NP_REG"
+_log "  Binder opened: $NP_BINDER"
+_log "  Transactions: $NP_TXNS"
+_log "  Replies sent: $NP_REPLIES"
+if [ "$NP_BINDER" -eq 0 ] && [ "$NPROXY_REGISTERED" -eq 1 ]; then
+    _log "  WARNING: registered but binder NOT opened - check BINDER_VERSION ioctl"
+fi
+if [ "$NP_TXNS" -eq 0 ] && [ "$NPROXY_REGISTERED" -eq 1 ]; then
+    _log "  WARNING: registered but NO transactions - SystemUI may use cached reference"
+    _log "  Try force-stop SystemUI or reboot"
+fi
+
 # Phase 8: Summary
 _log "============================================"
 _log "SUMMARY:"
@@ -565,6 +627,8 @@ while true; do
     sleep 300
     WD=$((WD+1))
 
+    _log "--- Watchdog $WD ---"
+
     NSE=$(settings get global network_stats_enabled 2>/dev/null)
     [ "$NSE" != "1" ] && settings put global network_stats_enabled 1 2>/dev/null \
         && _log "[WD-$WD] Restored network_stats_enabled"
@@ -572,6 +636,9 @@ while true; do
     RNM=$(settings get global restricted_networking_mode 2>/dev/null)
     [ "$RNM" = "1" ] && settings put global restricted_networking_mode 0 2>/dev/null \
         && _log "[WD-$WD] Cleared restricted_networking_mode"
+
+    chmod 0644 /proc/net/dev 2>/dev/null
+    chmod 0644 /proc/self/net/dev 2>/dev/null
 
     # Only restart netd if it died (not preemptively)
     NETD=$(getprop init.svc.netd 2>/dev/null)
@@ -582,7 +649,6 @@ while true; do
     if [ "$BPF_STATS_OK" -eq 1 ] && ! bpf_stats_ready; then
         _log "[WD-$WD] BPF maps lost, attempting gentle restore..."
         [ -d "$BPF_NETD/mainline_done" ] && rm -rf "$BPF_NETD/mainline_done" 2>/dev/null
-        # Just restart netd, don't restart bpfloader (could cause issues)
         setprop ctl.restart netd 2>/dev/null
         sleep 10
         if bpf_stats_ready; then
@@ -592,16 +658,45 @@ while true; do
         fi
     fi
 
-    # Netproxy heartbeat
+    # Netproxy heartbeat with log context on death
+    NP_PID=$(pidof netproxy 2>/dev/null || echo "")
     if [ -n "$NPROXY_BIN" ]; then
-        if ! pidof netproxy > /dev/null 2>&1; then
-            _log "[WD-$WD] Proxy died, restarting..."
+        if [ -z "$NP_PID" ]; then
+            _log "[WD-$WD] Proxy DIED, restarting..."
+            _log "[WD-$WD]  Last netproxy log lines before death:"
+            grep -E "ERROR|FATAL|FAILED|ioctl|binder|REGISTERED|TX#|SUMMARY|SENT" "$LOG" 2>/dev/null | tail -15 | while IFS= read -r l; do _log "  $l"; done
             NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
+            if [ -n "$NPROXY_PID" ]; then
+                _log "[WD-$WD]  Restarted as PID $NPROXY_PID"
+                for R in 1 2 3; do
+                    sleep 5
+                    if check_nproxy_registered; then
+                        _log "[WD-$WD]  Re-registered"
+                        am force-stop com.android.systemui 2>/dev/null || true
+                        break
+                    fi
+                done
+            fi
+        else
+            NPROXY_REG_CHECK=$(check_nproxy_registered && echo yes || echo no)
+            if [ "$NPROXY_REG_CHECK" = "no" ]; then
+                _log "[WD-$WD] Running PID $NP_PID but NOT registered, killing & restarting..."
+                kill -9 "$NP_PID" 2>/dev/null
+                sleep 2
+                rm -f "$REGFILE" 2>/dev/null
+                NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
+            fi
         fi
     fi
 
-    # Periodic status
-    if [ "$((WD % 12))" -eq 0 ]; then
-        _log "[WD-$WD] maps=$(count_bpf_maps) proxy=$(pidof netproxy 2>/dev/null || echo none) registered=$(check_nproxy_registered && echo yes || echo no) netd=$(getprop init.svc.netd 2>/dev/null)"
+    # Health metrics
+    NP_TXNS=$(grep -c "TX#" "$LOG" 2>/dev/null || echo 0)
+    NP_TOTAL_LINES=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+    NP_REG_CHECK=$(check_nproxy_registered && echo yes || echo no)
+    _log "[WD-$WD] maps=$(count_bpf_maps) proxy=$NP_PID reg=$NP_REG_CHECK txns=$NP_TXNS log_lines=$NP_TOTAL_LINES netd=$(getprop init.svc.netd 2>/dev/null)"
+
+    if [ "$WD" -eq 1 ]; then
+        _log "[WD-$WD] Full registration context:"
+        grep -E "REGISTERED|addService|binder opened|opened /dev|Cannot open|passive mode|FATAL|ERROR.*binder" "$LOG" 2>/dev/null | tail -20 | while IFS= read -r l; do _log "  $l"; done
     fi
 done

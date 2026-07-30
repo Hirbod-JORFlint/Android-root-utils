@@ -3,8 +3,9 @@ LOG=/data/local/tmp/netproxy.log
 
 _log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [post-fs-data-lite] $*" >> "$LOG"; }
 
-echo "" > "$LOG" 2>/dev/null || true
-chmod 0666 "$LOG" 2>/dev/null
+chmod 0666 "$LOG" 2>/dev/null || true
+echo "" >> "$LOG" 2>/dev/null || true
+echo "=== BOOT $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG" 2>/dev/null
 
 _log "=== post-fs-data-lite.sh started ==="
 _log "MODDIR: ${0%/*}"
@@ -56,6 +57,21 @@ if [ -d /data/misc/netstats ]; then
 else
     _log "  /data/misc/netstats: NOT FOUND (will be created)"
 fi
+
+_log "Binder devices:"
+for dev in /dev/binder /dev/vndbinder /dev/hwbinder; do
+    if [ -e "$dev" ]; then
+        _log "  $dev: EXISTS ($(ls -la "$dev" 2>/dev/null))"
+    else
+        _log "  $dev: NOT FOUND"
+    fi
+done
+
+_log "SELinux denials (binder/service_manager/netstats):"
+dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'binder|service_manager|servicemanager|netstats|proc_net' | tail -15 | while IFS= read -r l; do _log "  DENIAL: $l"; done
+
+_log "ServiceManager messages:"
+dmesg 2>/dev/null | grep -iE 'service_manager|binder:' | tail -10 | while IFS= read -r l; do _log "  SM: $l"; done
 
 _log "=== post-fs-data-lite.sh complete ==="
 exit 0

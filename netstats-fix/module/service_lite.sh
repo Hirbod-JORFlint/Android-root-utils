@@ -202,8 +202,21 @@ chmod 0644 /proc/net/dev 2>/dev/null
 chmod 0644 /proc/self/net/dev 2>/dev/null
 log "Permissions updated"
 
-log "dmesg SELinux denials (bpf/netd related):"
-dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'bpf|netd|bpfloader|proc_net|service_manager|netstats|servicemanager' | tail -20 | while IFS= read -r l; do warn "  DENIAL: $l"; done
+log "Binder devices:"
+for dev in /dev/binder /dev/vndbinder /dev/hwbinder; do
+    if [ -e "$dev" ]; then
+        local info=$(ls -la "$dev" 2>/dev/null)
+        log "  $dev: EXISTS ($info)"
+    else
+        log "  $dev: NOT FOUND"
+    fi
+done
+
+log "dmesg SELinux denials (binder/service_manager/netstats):"
+dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'binder|service_manager|servicemanager|netstats|proc_net' | tail -25 | while IFS= read -r l; do warn "  DENIAL: $l"; done
+
+log "dmesg ServiceManager messages:"
+dmesg 2>/dev/null | grep -iE 'service_manager|binder:' | tail -10 | while IFS= read -r l; do log "  SM: $l"; done
 
 apply_sepolicy
 
@@ -238,29 +251,50 @@ fi
 log_sep "PHASE 3: Wait for registration"
 local REG_OK=0
 local START_TS=$(date +%s)
+local LAST_LOG_LINE_COUNT=$(wc -l < "$LOG" 2>/dev/null || echo 0)
 for RTRY in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     local waited=$(($(date +%s) - START_TS))
     if [ -n "$PROXY_PID" ] && ! kill -0 "$PROXY_PID" 2>/dev/null; then
-        warn "Proxy died at ${waited}s, restarting..."
+        warn "Proxy died at ${waited}s (was PID $PROXY_PID), restarting..."
+        log "  Last log lines before death:"
+        tail -20 "$LOG" 2>/dev/null | while IFS= read -r l; do log "  | $l"; done
         PROXY_PID=$(start_nproxy "$PROXY_BIN")
         [ -z "$PROXY_PID" ] && PROXY_PID=$(start_nproxy "$PROXY_BIN" "u:r:system_app:s0")
+        if [ -n "$PROXY_PID" ]; then
+            log "  Restarted as PID $PROXY_PID"
+        else
+            warn "  Could not restart proxy!"
+        fi
     fi
 
     if check_registered; then
         REG_OK=1
         log "*** REGISTERED (attempt $RTRY, ${waited}s) ***"
         log "Registration log context:"
-        grep -i "registered\|REGISTERED" "$LOG" 2>/dev/null | tail -5 | while IFS= read -r l; do log "  $l"; done
+        grep -i "registered\|REGISTERED\|SELINUX\|addService\|add_service\|binder opened" "$LOG" 2>/dev/null | tail -15 | while IFS= read -r l; do log "  $l"; done
         break
     fi
+
+    # Show latest netproxy log lines every 3 attempts
+    if [ "$((RTRY % 3))" -eq 0 ]; then
+        local new_lines=$(($(wc -l < "$LOG" 2>/dev/null || echo 0) - LAST_LOG_LINE_COUNT))
+        if [ "$new_lines" -gt 0 ]; then
+            log "  netproxy log since last check ($new_lines new lines):"
+            tail -$((new_lines > 20 ? 20 : new_lines)) "$LOG" 2>/dev/null | grep -E "ERROR|WARNING|REGISTER|FAIL|opened|ioctl|addService|BR_" | while IFS= read -r l; do log "  NP: $l"; done
+        fi
+        LAST_LOG_LINE_COUNT=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+    fi
+
     sleep 3
 
     if [ "$((RTRY % 4))" -eq 0 ]; then
         apply_sepolicy
-        local denials=$(dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'service_manager|servicemanager|proc_net' | tail -5)
+        local denials=$(dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'service_manager|servicemanager|binder|proc_net' | tail -5)
         [ -n "$denials" ] && echo "$denials" | while IFS= read -r l; do warn "  DENIAL: $l"; done
+        log "  ServiceManager state check:"
+        dmesg 2>/dev/null | grep -iE 'service_manager.*netstats|netstats.*service' | tail -5 | while IFS= read -r l; do log "  SM: $l"; done
     fi
-    log "Registration: attempt $RTRY/20 (${waited}s), proxy=$(pidof netproxy 2>/dev/null || echo dead)"
+    log "Registration: attempt $RTRY/20 (${waited}s), proxy=$(pidof netproxy 2>/dev/null || echo dead), log_lines=$(wc -l < "$LOG" 2>/dev/null || echo ?)"
 done
 
 if [ "$REG_OK" -eq 0 ]; then
@@ -323,6 +357,31 @@ log "  network_stats_enabled: $(settings get global network_stats_enabled 2>/dev
 log "  netstats_dev.xml: $(ls -la $NETSTATS_DIR/netstats_dev.xml 2>/dev/null | awk '{print $5 " bytes"}')"
 log "  stats file rx: $srx"
 log "  stats file tx: $stx"
+log "  Total log lines: $(wc -l < "$LOG" 2>/dev/null || echo ?)"
+
+# Netproxy log analysis
+log "Netproxy log analysis:"
+local NP_LOG="$LOG"
+local grep_errors=$(grep -ciE "ERROR|FATAL|FAILED|denied|WARNING" "$NP_LOG" 2>/dev/null || echo 0)
+local grep_reg=$(grep -c "REGISTERED\|registered '" "$NP_LOG" 2>/dev/null || echo 0)
+local grep_binder=$(grep -c "binder opened" "$NP_LOG" 2>/dev/null || echo 0)
+local grep_txns=$(grep -c ">>> TX" "$NP_LOG" 2>/dev/null || echo 0)
+local grep_replies=$(grep -c "<<< REPLY\|REPLY SENT" "$NP_LOG" 2>/dev/null || echo 0)
+log "  Errors/warnings: $grep_errors, Registrations: $grep_reg, Binder opened: $grep_binder"
+log "  Transactions received: $grep_txns, Replies sent: $grep_replies"
+if [ "$grep_binder" -eq 0 ]; then
+    warn "  BINDER NOT OPENED - netproxy cannot intercept stats calls!"
+    warn "  Check 'Cannot open binder' or 'ioctl.*failed' in log"
+fi
+if [ "$grep_txns" -eq 0 ] && [ "$REG_OK" -eq 1 ]; then
+    warn "  REGISTERED but NO TRANSACTIONS - SystemUI may not be querying stats"
+    warn "  SystemUI might be using cached reference to real service"
+    warn "  Try force-stop SystemUI or reboot"
+fi
+if [ "$grep_txns" -eq 0 ] && [ "$REG_OK" -eq 0 ]; then
+    warn "  NOT REGISTERED - SystemUI is talking directly to real netstats service"
+fi
+
 log_sep "Main execution complete - entering watchdog"
 
 background_updater &
@@ -338,25 +397,39 @@ while true; do
     chmod 0644 /proc/net/dev 2>/dev/null
     chmod 0644 /proc/self/net/dev 2>/dev/null
 
+    local np=$(pidof netproxy 2>/dev/null || echo "")
+    local np_reg="?"
+    local np_txns=$(grep -c "TX#" "$LOG" 2>/dev/null || echo 0)
+    local np_total_lines=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+    
     if [ -n "$PROXY_BIN" ]; then
-        local np=$(pidof netproxy 2>/dev/null)
         if [ -z "$np" ]; then
-            warn "[WD] netproxy died, restarting..."
+            warn "[WD] netproxy DIED (was PID $PROXY_PID), restarting..."
+            log "[WD]  Last netproxy log lines before death:"
+            grep -E "ERROR|FATAL|FAILED|ioctl|binder|REGISTERED|TX#|SUMMARY|SENT" "$LOG" 2>/dev/null | tail -15 | while IFS= read -r l; do log "  $l"; done
             PROXY_PID=$(start_nproxy "$PROXY_BIN")
             [ -z "$PROXY_PID" ] && PROXY_PID=$(start_nproxy "$PROXY_BIN" "u:r:system_app:s0")
-            for R in 1 2 3; do
-                sleep 5
-                if check_registered; then
-                    log "[WD] Re-registered"
-                    am force-stop com.android.systemui 2>/dev/null || true
-                    break
-                fi
-            done
-        elif ! check_registered; then
-            warn "[WD] Running but NOT registered, killing & restarting..."
-            kill -9 "$np" 2>/dev/null; sleep 2; rm -f "$REGFILE"
-            PROXY_PID=$(start_nproxy "$PROXY_BIN")
-            [ -z "$PROXY_PID" ] && PROXY_PID=$(start_nproxy "$PROXY_BIN" "u:r:system_app:s0")
+            if [ -n "$PROXY_PID" ]; then
+                log "[WD]  Restarted as PID $PROXY_PID"
+                for R in 1 2 3; do
+                    sleep 5
+                    if check_registered; then
+                        log "[WD]  Re-registered"
+                        am force-stop com.android.systemui 2>/dev/null || true
+                        break
+                    fi
+                done
+            fi
+        else
+            if check_registered; then
+                np_reg="yes"
+            else
+                np_reg="no"
+                warn "[WD] Running PID $np but NOT registered, killing & restarting..."
+                kill -9 "$np" 2>/dev/null; sleep 2; rm -f "$REGFILE"
+                PROXY_PID=$(start_nproxy "$PROXY_BIN")
+                [ -z "$PROXY_PID" ] && PROXY_PID=$(start_nproxy "$PROXY_BIN" "u:r:system_app:s0")
+            fi
         fi
     fi
 
@@ -364,5 +437,10 @@ while true; do
     update_proxy_stats
     local sr=$(grep '^rx_bytes=' "$STATSFILE" 2>/dev/null | cut -d= -f2)
     local st=$(grep '^tx_bytes=' "$STATSFILE" 2>/dev/null | cut -d= -f2)
-    log "[WD] stats: rx=$sr tx=$st proxy=$(pidof netproxy 2>/dev/null || echo dead) reg=$(check_registered && echo yes || echo no)"
+    local np_sysui_txns=$(grep -c "sender_euid=10027\|uid=10027\|com.android.systemui\|sender_pid.*7075\|sender_pid.*$(pidof com.android.systemui 2>/dev/null)" "$LOG" 2>/dev/null || echo 0)
+    log "[WD] stats: rx=$sr tx=$st proxy=$np reg=$np_reg sysui_txns=$np_txns log_lines=$np_total_lines"
+    if [ "$WD" -eq 1 ]; then
+        log "[WD] Full netproxy registration context:"
+        grep -E "REGISTERED|addService|binder opened|opened /dev|Cannot open|passive mode|FATAL|ERROR.*binder" "$LOG" 2>/dev/null | tail -20 | while IFS= read -r l; do log "  $l"; done
+    fi
 done

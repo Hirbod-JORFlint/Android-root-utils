@@ -183,7 +183,8 @@ struct binder_pri_ptr_cookie {
 };
 
 #define BINDER_WRITE_READ        0xC0306201
-#define BINDER_VERSION           0xC0186209
+/* BINDER_VERSION is _IOWR('b', 9, __s32) = 0xC0046209 (size=4) */
+#define BINDER_VERSION           0xC0046209
 #define BINDER_SET_MAX_THREADS   0x40086205
 
 /* ============================================================
@@ -346,6 +347,77 @@ static void update_stats_file_detailed(void) {
 }
 
 /* ============================================================
+ * Session management (declared early for debug counters)
+ * ============================================================ */
+static int session_count = 0;
+static uint64_t session_ptrs[MAX_SESSIONS];
+static uint64_t session_cookies[MAX_SESSIONS];
+
+/* ============================================================
+ * Debug counters
+ * ============================================================ */
+
+static int g_registration_attempts = 0;
+static int g_br_transaction_count = 0;
+static int g_br_reply_count = 0;
+static int g_br_error_count = 0;
+static int g_br_dead_count = 0;
+static int g_br_other_count = 0;
+static int g_build_session_count = 0;
+static int g_build_stats_count = 0;
+static int g_build_network_count = 0;
+static int g_build_void_count = 0;
+static int g_unknown_code_count = 0;
+static int g_session_open_count = 0;
+static int g_session_close_count = 0;
+static time_t g_last_summary = 0;
+
+/* ============================================================
+ * Hex dump helper for debugging parcel content
+ * ============================================================ */
+static void hex_dump(const char* label, const uint8_t* data, uint32_t len) {
+    char buf[2048];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s (%u bytes):", label, len);
+    uint32_t dump_len = len > 64 ? 64 : len;
+    for (uint32_t i = 0; i < dump_len && pos < (int)sizeof(buf) - 16; i++) {
+        if (i % 16 == 0) pos += snprintf(buf + pos, sizeof(buf) - pos, "\n  ");
+        else if (i % 8 == 0) pos += snprintf(buf + pos, sizeof(buf) - pos, " ");
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x ", data[i]);
+    }
+    if (len > 64) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "\n  ... (%u more bytes)", len - 64);
+    }
+    log_msg(buf);
+}
+
+/* ============================================================
+ * Log summary of operations periodically
+ * ============================================================ */
+static void log_summary(void) {
+    time_t now = time(NULL);
+    if (now - g_last_summary < 60) return;  /* once per minute */
+    g_last_summary = now;
+
+    struct net_stats s;
+    memset(&s, 0, sizeof(s));
+    read_all_stats(&s);
+
+    log_fmt("--- [SUMMARY] @ %lld ---", (long long)now);
+    log_fmt("  BR: txns=%d replies=%d errors=%d dead=%d other=%d",
+            g_br_transaction_count, g_br_reply_count, g_br_error_count, g_br_dead_count, g_br_other_count);
+    log_fmt("  sessions: open=%d close=%d active=%d",
+            g_session_open_count, g_session_close_count, session_count);
+    log_fmt("  replies: session=%d stats=%d netstats=%d void=%d unknown=%d",
+            g_build_session_count, g_build_stats_count, g_build_network_count,
+            g_build_void_count, g_unknown_code_count);
+    log_fmt("  registrations_attempted=%d", g_registration_attempts);
+    log_fmt("  proc_net_dev: rx=%llu tx=%llu rxp=%llu txp=%llu",
+            (unsigned long long)s.rxBytes, (unsigned long long)s.txBytes,
+            (unsigned long long)s.rxPackets, (unsigned long long)s.txPackets);
+}
+
+/* ============================================================
  * Binder IPC
  * ============================================================ */
 static int binder_fd = -1;
@@ -363,35 +435,62 @@ static int do_ioctl(int fd, unsigned long cmd, void* arg) {
 
 static int open_binder(void) {
     const char* paths[] = { "/dev/binder", "/dev/vndbinder", "/dev/hwbinder", NULL };
-    for (int i = 0; i < 10 && paths[i]; i++) {  /* Retry up to 10 times */
-        binder_fd = open(paths[i], O_RDWR | O_CLOEXEC);
-        if (binder_fd >= 0) { log_fmt("opened %s (attempt %d)", paths[i], i+1); break; }
-        if (i < 9) usleep(500000);
-    }
-    if (binder_fd < 0) { log_errno("open binder device"); return -1; }
 
-    struct binder_version ver;
-    memset(&ver, 0, sizeof(ver));
-    if (do_ioctl(binder_fd, BINDER_VERSION, &ver) < 0) {
-        close(binder_fd); binder_fd = -1; return -1;
-    }
-    log_fmt("binder protocol version %d", ver.protocol_version);
+    /* Try each binder device path */
+    for (int pi = 0; paths[pi]; pi++) {
+        const char* devpath = paths[pi];
+        for (int attempt = 0; attempt < 10; attempt++) {
+            int fd = open(devpath, O_RDWR | O_CLOEXEC);
+            if (fd >= 0) {
+                log_fmt("opened %s (attempt %d)", devpath, attempt + 1);
 
-    uint32_t max_threads = 32;
-    do_ioctl(binder_fd, BINDER_SET_MAX_THREADS, &max_threads);
+                /* Probe BINDER_VERSION (non-fatal — assume v1 on failure) */
+                struct binder_version ver;
+                memset(&ver, 0, sizeof(ver));
+                int vret = ioctl(fd, BINDER_VERSION, &ver);
+                if (vret == 0) {
+                    log_fmt("  %s: binder protocol version %d", devpath, ver.protocol_version);
+                } else {
+                    log_fmt("  %s: BINDER_VERSION ioctl failed (errno=%d), assuming v1", devpath, errno);
+                }
 
-    binder_map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
-                                MAP_PRIVATE | MAP_NORESERVE, binder_fd, 0);
-    if (binder_map == MAP_FAILED) {
-        binder_map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
-                                    MAP_PRIVATE, binder_fd, 0);
-        if (binder_map == MAP_FAILED) {
-            log_errno("mmap binder");
-            close(binder_fd); binder_fd = -1; return -1;
+                /* Set max threads */
+                uint32_t max_threads = 32;
+                ioctl(fd, BINDER_SET_MAX_THREADS, &max_threads);
+
+                /* mmap binder fd */
+                uint8_t* map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
+                                              MAP_PRIVATE | MAP_NORESERVE, fd, 0);
+                if (map == MAP_FAILED) {
+                    map = (uint8_t*)mmap(NULL, BINDER_MMAP_SIZE, PROT_READ,
+                                        MAP_PRIVATE, fd, 0);
+                }
+                if (map == MAP_FAILED) {
+                    log_fmt("  %s: mmap failed, trying next device", devpath);
+                    close(fd);
+                    break;  /* try next device path */
+                }
+
+                /* Success — commit */
+                binder_fd = fd;
+                binder_map = map;
+                log_fmt("binder ready: %s mmap=%p size=%d", devpath, (void*)binder_map, BINDER_MMAP_SIZE);
+                return 0;
+            }
+
+            /* File not found — skip to next path immediately */
+            if (errno == ENOENT) {
+                log_fmt("  %s: not found (ENOENT), skipping", devpath);
+                break;
+            }
+
+            /* Transient error — retry */
+            if (attempt < 9) usleep(500000);
         }
     }
-    log_fmt("binder opened, mmap %d bytes at %p", BINDER_MMAP_SIZE, (void*)binder_map);
-    return 0;
+
+    log_msg("FATAL: no binder device could be opened");
+    return -1;
 }
 
 static int send_binder_cmd(const void* cmd, size_t cmd_size) {
@@ -476,7 +575,9 @@ static void write_int64_array(uint8_t** buf, const int64_t* arr, int32_t len) {
 static size_t build_stats_result_reply(uint8_t* buf, size_t buf_size,
                                        uint64_t rxBytes, uint64_t rxPackets,
                                        uint64_t txBytes, uint64_t txPackets) {
+    (void)buf_size;
     uint8_t* p = buf;
+    g_build_stats_count++;
     write_int32(&p, 0);          /* exception = 0 */
     write_int32(&p, 1);          /* non-null parcelable */
     write_int32(&p, 36);         /* StatsResult size (4 longs = 32 bytes + 4 byte header) */
@@ -484,6 +585,10 @@ static size_t build_stats_result_reply(uint8_t* buf, size_t buf_size,
     write_int64(&p, rxPackets);
     write_int64(&p, txBytes);
     write_int64(&p, txPackets);
+    log_fmt("[REPLY] StatsResult: rxB=%llu rxP=%llu txB=%llu txP=%llu size=%zu",
+            (unsigned long long)rxBytes, (unsigned long long)rxPackets,
+            (unsigned long long)txBytes, (unsigned long long)txPackets,
+            (size_t)(p - buf));
     return (size_t)(p - buf);
 }
 
@@ -512,11 +617,12 @@ static size_t build_stats_result_reply(uint8_t* buf, size_t buf_size,
 static size_t build_network_stats_reply(uint8_t* buf, size_t buf_size,
                                          uint64_t rxBytes, uint64_t rxPackets,
                                          uint64_t txBytes, uint64_t txPackets) {
+    (void)buf_size;
     uint8_t* p = buf;
+    g_build_network_count++;
     write_int32(&p, 0);  /* exception */
 
     /* Start of NetworkStats Parcelable */
-    uint8_t* netstats_start = p;
     write_int32(&p, 1);  /* non-null */
 
     /* elapsedRealtime */
@@ -563,9 +669,14 @@ static size_t build_network_stats_reply(uint8_t* buf, size_t buf_size,
     /* operations array */
     { int64_t val[] = {0}; write_int64_array(&p, val, 1); }
 
-    log_fmt("  built NetworkStats reply: %zu bytes, rx=%llu tx=%llu",
-            (size_t)(p - buf), (unsigned long long)rxBytes, (unsigned long long)txBytes);
-    return (size_t)(p - buf);
+    size_t total_sz = (size_t)(p - buf);
+    log_fmt("[REPLY] NetworkStats: rxB=%llu rxP=%llu txB=%llu txP=%llu size=%zu",
+            (unsigned long long)rxBytes, (unsigned long long)rxPackets,
+            (unsigned long long)txBytes, (unsigned long long)txPackets,
+            total_sz);
+    log_fmt("[REPLY] NetworkStats hex:");
+    hex_dump("  NETSTATS", buf, (uint32_t)total_sz);
+    return total_sz;
 }
 
 /* ============================================================
@@ -573,14 +684,8 @@ static size_t build_network_stats_reply(uint8_t* buf, size_t buf_size,
  * ============================================================ */
 static size_t build_void_reply(uint8_t* buf) {
     uint8_t* p = buf;
+    g_build_void_count++;
     write_int32(&p, 0);  /* exception */
-    return (size_t)(p - buf);
-}
-
-static size_t build_int_reply(uint8_t* buf, int32_t val) {
-    uint8_t* p = buf;
-    write_int32(&p, 0);  /* exception */
-    write_int32(&p, val);
     return (size_t)(p - buf);
 }
 
@@ -808,37 +913,47 @@ static uint64_t pick_stat(const struct net_stats* s, int type) {
 }
 
 /* ============================================================
- * Session management
+ * Session management (arrays declared above with debug vars)
  * ============================================================ */
-static int session_count = 0;
-static uint64_t session_ptrs[MAX_SESSIONS];
-static uint64_t session_cookies[MAX_SESSIONS];
-
 static uint64_t create_session(void) {
     if (session_count >= MAX_SESSIONS) {
-        log_fmt("WARNING: max sessions reached (%d)", MAX_SESSIONS);
+        log_fmt("WARNING: max sessions reached (%d), wrapping to 0", MAX_SESSIONS);
         session_count = 0;
     }
     uint64_t ptr = (uint64_t)(uintptr_t)(binder_map + SESSION_BASE + session_count * 0x1000);
     session_ptrs[session_count] = ptr;
     session_cookies[session_count] = ptr;
+    g_session_open_count++;
+    log_fmt("[SESS] create #%d: ptr=0x%llx (total_open=%d active=%d)",
+            session_count, (unsigned long long)ptr,
+            g_session_open_count, session_count + 1);
     session_count++;
-    log_fmt("Created session %d: ptr=0x%llx", session_count - 1, (unsigned long long)ptr);
     return ptr;
 }
 
 static int is_session_ptr(uint64_t ptr) {
     for (int i = 0; i < session_count; i++) {
-        if (session_ptrs[i] == ptr) return i;
+        if (session_ptrs[i] == ptr) {
+            log_fmt("[SESS] lookup: ptr=0x%llx -> idx=%d", (unsigned long long)ptr, i);
+            return i;
+        }
     }
+    log_fmt("[SESS] lookup: ptr=0x%llx -> NOT FOUND (count=%d)", (unsigned long long)ptr, session_count);
     return -1;
 }
 
 static void destroy_session(int idx) {
-    if (idx < 0 || idx >= session_count) return;
+    if (idx < 0 || idx >= session_count) {
+        log_fmt("[SESS] destroy: idx=%d INVALID (count=%d)", idx, session_count);
+        return;
+    }
+    uint64_t ptr = session_ptrs[idx];
+    g_session_close_count++;
     session_ptrs[idx] = session_ptrs[session_count - 1];
     session_cookies[idx] = session_cookies[session_count - 1];
     session_count--;
+    log_fmt("[SESS] destroy idx=%d ptr=0x%llx -> active=%d total_closed=%d",
+            idx, (unsigned long long)ptr, session_count, g_session_close_count);
 }
 
 /* ============================================================
@@ -874,10 +989,14 @@ static uint64_t main_service_cookie = 0;
 
 static void handle_transaction(const struct binder_transaction_data* tr) {
     uint8_t reply_data[8192];
-    uint8_t* rp = reply_data;
     int session_idx = -1;
     int is_session = 0;
     int32_t binder_offset = -1;  /* offset of flat_binder_object in reply, -1 = none */
+    uint32_t code = tr->code;
+    struct net_stats s;
+    read_all_stats(&s);
+
+    g_br_transaction_count++;
 
     if (main_service_ptr != 0 && tr->target.ptr == main_service_ptr) {
         is_session = 0;  /* Main service */
@@ -888,14 +1007,28 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
         }
     }
 
-    uint32_t code = tr->code;
-    struct net_stats s;
-    read_all_stats(&s);
+    /* Log full transaction details */
+    const uint8_t* raw_data = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
+    uint64_t raw_size = tr->data_size;
+    log_fmt("[TX#%d] >>> code=%u(0x%x) %s flags=0x%x data_sz=%llu pid=%d euid=%u tgt_ptr=0x%llx",
+            g_br_transaction_count, code, code, is_session ? "[SESSION]" : "[SERVICE]",
+            tr->flags, (unsigned long long)raw_size,
+            tr->sender_pid, tr->sender_euid,
+            (unsigned long long)tr->target.ptr);
 
-    log_fmt(">>> TX: code=%u(0x%x) %s flags=0x%x data_size=%llu pid=%d uid=%u",
-            code, code, is_session ? "[SESSION]" : "[SERVICE]",
-            tr->flags, (unsigned long long)tr->data_size,
-            tr->sender_pid, tr->sender_euid);
+    /* Dump raw transaction data hex for first 5 transactions, then sample */
+    if (raw_size > 0 && raw_data) {
+        if (g_br_transaction_count <= 5 || (g_br_transaction_count % 100 == 0)) {
+            hex_dump("[TX-DATA]", raw_data, (uint32_t)(raw_size > 128 ? 128 : raw_size));
+        }
+    } else {
+        log_fmt("[TX#%d]  no data", g_br_transaction_count);
+    }
+
+    log_fmt("[TX#%d]  stats: rx=%llu tx=%llu rxp=%llu txp=%llu",
+            g_br_transaction_count,
+            (unsigned long long)s.rxBytes, (unsigned long long)s.txBytes,
+            (unsigned long long)s.rxPackets, (unsigned long long)s.txPackets);
 
     size_t reply_size = 0;
 
@@ -906,8 +1039,6 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
         switch (code) {
             case SESS_getDeviceSummaryForNetwork:
             case SESS_getSummaryForNetwork: {
-                /* Read NetworkTemplate, startTime, endTime from input */
-                const uint8_t* pp = (const uint8_t*)(uintptr_t)tr->data.ptr.buffer;
                 /* Skip the NetworkTemplate (complex parcelable) - we don't need it */
                 /* Just skip to the end of the data */
                 /* Actually, we need to skip carefully */
@@ -1210,8 +1341,19 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
     uint8_t discard[4096];
     size_t consumed = 0;
     int ret = send_bc_with_reply(rwbuf, write_len, discard, sizeof(discard), &consumed);
-    if (ret < 0) log_errno("send BC_REPLY");
+    if (ret < 0) {
+        log_errno("send BC_REPLY");
+        log_fmt("[TX#%d] <<< REPLY FAILED (ioctl errno=%d)", g_br_transaction_count, errno);
+    } else {
+        if (g_br_transaction_count <= 10 || g_br_transaction_count % 50 == 0) {
+            log_fmt("[TX#%d] <<< REPLY SENT: code=%u reply_sz=%zu offsets=%u consumed=%zu ret=%d",
+                    g_br_transaction_count, code, reply_size, offsets_bytes, consumed, ret);
+        }
+    }
     free(rwbuf);
+    update_stats_file_detailed();
+
+    log_summary();
 }
 
 static void run_event_loop(void) {
@@ -1220,6 +1362,7 @@ static void run_event_loop(void) {
     log_msg("Entering main event loop...");
     int consecutive_errors = 0;
     int loop_count = 0;
+    time_t last_stats_update = 0;
 
     while (1) {
         size_t consumed = 0;
@@ -1246,7 +1389,18 @@ static void run_event_loop(void) {
 
         if (consumed == 0) {
             loop_count++;
-            if (loop_count % 60 == 0) update_stats_file_detailed();
+            /* Periodic stats file update */
+            time_t now_t = time(NULL);
+            if (now_t - last_stats_update >= 30) {
+                update_stats_file_detailed();
+                last_stats_update = now_t;
+            }
+            /* Periodic summary */
+            log_summary();
+            if (loop_count % 7200 == 0) {
+                log_fmt("[EVENT-LOOP] alive: loops=%d txns=%d sessions=%d fds.ready=1",
+                        loop_count, g_br_transaction_count, session_count);
+            }
             usleep(50000);
             continue;
         }
@@ -1267,6 +1421,10 @@ static void run_event_loop(void) {
                     break;
                 }
                 case BR_REPLY: {
+                    g_br_reply_count++;
+                    if (g_br_reply_count <= 5) {
+                        log_fmt("[BR] REPLY #%d", g_br_reply_count);
+                    }
                     if (rp + sizeof(struct binder_transaction_data) > rend) goto loop_end;
                     const struct binder_transaction_data* trp =
                         (const struct binder_transaction_data*)rp;
@@ -1303,13 +1461,32 @@ static void run_event_loop(void) {
                     if (rp + 8 <= rend) rp += 8;
                     break;
                 case BR_FAILED_REPLY:
-                case BR_DEAD_REPLY:
+                    g_br_error_count++;
+                    if (g_br_error_count <= 5 || g_br_error_count % 50 == 0) {
+                        log_fmt("[BR] FAILED_REPLY #%d", g_br_error_count);
+                    }
                     break;
-                case BR_ERROR:
+                case BR_DEAD_REPLY:
+                    g_br_dead_count++;
+                    if (g_br_dead_count <= 5 || g_br_dead_count % 50 == 0) {
+                        log_fmt("[BR] DEAD_REPLY #%d", g_br_dead_count);
+                    }
+                    break;
+                case BR_ERROR: {
+                    g_br_error_count++;
+                    int32_t berr = 0;
+                    if (rp + 4 <= rend) memcpy(&berr, rp, 4);
+                    if (g_br_error_count <= 10 || g_br_error_count % 50 == 0) {
+                        log_fmt("[BR] ERROR=%d #%d", berr, g_br_error_count);
+                    }
                     if (rp + 4 <= rend) rp += 4;
                     break;
+                }
                 default:
-                    log_fmt("event loop: unknown cmd 0x%x", cmd);
+                    g_br_other_count++;
+                    if (g_br_other_count <= 5) {
+                        log_fmt("[BR] unknown cmd 0x%x (total=%d)", cmd, g_br_other_count);
+                    }
                     goto loop_end;
             }
         }
@@ -1324,21 +1501,6 @@ static void sig_handler(int sig) {
     if (binder_map && binder_map != MAP_FAILED) munmap(binder_map, BINDER_MMAP_SIZE);
     if (binder_fd >= 0) close(binder_fd);
     _exit(0);
-}
-
-/* Try to kill existing netstats service if possible */
-static void try_kill_netstats(void) {
-    /* Check if real NetworkStatsService is registered */
-    int exists = aidl_check_service("netstats");
-    if (exists == 0) {
-        log_msg("netstats service not found - netproxy will be primary");
-        return;
-    }
-    if (exists > 0) {
-        log_msg("netstats service EXISTS - attempting to override");
-        /* On some GSIs, the real service is from APEX and can't be killed.
-         * We'll try to register anyway and let ServiceManager decide. */
-    }
 }
 
 int main(void) {
@@ -1411,26 +1573,46 @@ int main(void) {
 
     log_fmt("Using main service binder ptr: 0x%llx", (unsigned long long)main_service_ptr);
 
+    g_registration_attempts = 0;
     int registered = 0;
     for (int round = 0; round < 5 && !registered; round++) {
         log_fmt("--- Registration round %d/5 ---", round + 1);
         for (int i = 0; SERVICE_NAMES[i]; i++) {
-            log_fmt("Trying '%s'...", SERVICE_NAMES[i]);
+            g_registration_attempts++;
+            log_fmt("[REG#%d] Trying '%s'...", g_registration_attempts, SERVICE_NAMES[i]);
 
+            /* First check if service already exists */
             int exists = aidl_check_service(SERVICE_NAMES[i]);
             if (exists > 0) {
-                log_fmt("'%s' already registered (exists=%d), trying to override anyway", SERVICE_NAMES[i], exists);
+                log_fmt("[REG#%d] '%s' ALREADY EXISTS in ServiceManager (ret=%d), will try to override",
+                        g_registration_attempts, SERVICE_NAMES[i], exists);
+            } else if (exists == 0) {
+                log_fmt("[REG#%d] '%s' not registered yet, good", g_registration_attempts, SERVICE_NAMES[i]);
+            } else {
+                log_fmt("[REG#%d] '%s' check FAILED (ret=%d), trying add anyway",
+                        g_registration_attempts, SERVICE_NAMES[i], exists);
             }
 
+            /* Attempt to register */
+            log_fmt("[REG#%d] calling addService('%s', ptr=0x%llx, cookie=0x%llx)...",
+                    g_registration_attempts, SERVICE_NAMES[i],
+                    (unsigned long long)main_service_ptr,
+                    (unsigned long long)main_service_cookie);
             int ret = aidl_add_service(SERVICE_NAMES[i], main_service_ptr, main_service_cookie);
+            log_fmt("[REG#%d] addService('%s') returned %d (%s)",
+                    g_registration_attempts, SERVICE_NAMES[i], ret,
+                    ret >= 0 ? "SUCCESS" : "FAILED");
+
             if (ret >= 0) {
-                log_fmt("*** REGISTERED as '%s'! ***", SERVICE_NAMES[i]);
+                log_fmt("*** REGISTERED as '%s'! (round %d, attempt %d) ***",
+                        SERVICE_NAMES[i], round + 1, g_registration_attempts);
                 registered = 1;
 
                 /* Write registration marker */
                 FILE* rf = fopen(REGFILE, "w");
                 if (rf) {
-                    fprintf(rf, "registered=1\nservice=%s\nversion=%s\n", SERVICE_NAMES[i], NETPROXY_VERSION);
+                    fprintf(rf, "registered=1\nservice=%s\nversion=%s\nattempt=%d\nround=%d\n",
+                            SERVICE_NAMES[i], NETPROXY_VERSION, g_registration_attempts, round + 1);
                     fclose(rf);
                 }
                 chmod(REGFILE, 0644);
@@ -1439,11 +1621,12 @@ int main(void) {
         }
 
         if (!registered && round < 4) {
-            log_fmt("Registration round %d failed, waiting %ds before retry...", round + 1, 5 + round * 2);
+            log_fmt("[REG] Round %d FAILED, waiting %ds before retry...", round + 1, 5 + round * 2);
             sleep(5 + round * 2);
 
             /* Log any SELinux denials between rounds */
-            FILE* dmesg_p = popen("dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'service_manager|servicemanager|netstats' | tail -10", "r");
+            log_fmt("[REG] Checking SELinux denials...");
+            FILE* dmesg_p = popen("dmesg 2>/dev/null | grep 'avc:.*denied' | grep -iE 'service_manager|servicemanager|netstats|binder' | tail -15", "r");
             if (dmesg_p) {
                 char line[256];
                 while (fgets(line, sizeof(line), dmesg_p)) {
@@ -1451,6 +1634,17 @@ int main(void) {
                     log_fmt("  SELINUX: %s", line);
                 }
                 pclose(dmesg_p);
+            }
+
+            /* Also log current ServiceManager state */
+            FILE* sm_p = popen("dmesg 2>/dev/null | grep -i 'service_manager' | tail -5", "r");
+            if (sm_p) {
+                char line[256];
+                while (fgets(line, sizeof(line), sm_p)) {
+                    line[strcspn(line, "\n")] = 0;
+                    log_fmt("  SM: %s", line);
+                }
+                pclose(sm_p);
             }
         }
     }
