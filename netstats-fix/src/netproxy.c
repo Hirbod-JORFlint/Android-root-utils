@@ -351,7 +351,32 @@ static int do_transaction(uint32_t handle, uint32_t code,
             switch (cmd) {
                 case BR_NOOP:
                 case BR_TRANSACTION_COMPLETE:
+                case BR_FINISHED:
+                case BR_FROZEN_REPLY:
+                case BR_ONEWAY_SPAM_SUSPECT:
+                case BR_TRANSACTION_PENDING_FROZEN:
                     break;
+                case BR_SPAWN_LOOPER: {
+                    uint32_t c = BC_ENTER_LOOPER;
+                    send_bc((const uint8_t*)&c, sizeof(c), NULL, 0, NULL);
+                    break;
+                }
+                case BR_ACQUIRE_RESULT:
+                    /* 4-byte result code; just skip it */
+                    if (rp + 4 <= rend) rp += 4;
+                    break;
+                case BR_ATTEMPT_ACQUIRE: {
+                    if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
+                        binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                        binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                        uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
+                        *(uint32_t*)ack = BC_ACQUIRE_DONE;
+                        memcpy(ack + 4, &ptr,    sizeof(binder_uintptr_t));
+                        memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
+                        send_bc(ack, sizeof(ack), NULL, 0, NULL);
+                    }
+                    break;
+                }
                 case BR_REPLY: {
                     if (rp + sizeof(struct binder_transaction_data) > rend) {
                         goto done_parse;
@@ -411,8 +436,15 @@ static int do_transaction(uint32_t handle, uint32_t code,
                 }
                 default:
                     log_fmt("unexpected cmd 0x%x in transaction", cmd);
-                    /* Skip rest to avoid parsing garbage */
-                    rp = rend;
+                    /* Skip 8 bytes of payload (common for ptr_cookie) and
+                     * continue searching for BR_REPLY. Do NOT skip remaining
+                     * data as that would lose the reply. */
+                    {
+                        int skip = 8;
+                        const uint8_t* next = rp + skip;
+                        if (next > rend) next = rend;
+                        rp = next;
+                    }
                     break;
             }
         }
@@ -857,10 +889,35 @@ static void run_event_loop(void) {
                     log_fmt("BR_ERROR: %d", err);
                     break;
                 }
+                case BR_ACQUIRE_RESULT:
+                    if (rp + 4 <= rend) rp += 4;
+                    break;
+                case BR_FINISHED:
+                case BR_FROZEN_REPLY:
+                case BR_ONEWAY_SPAM_SUSPECT:
+                case BR_TRANSACTION_PENDING_FROZEN:
+                    break;
+                case BR_ATTEMPT_ACQUIRE: {
+                    if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
+                        binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                        binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                        uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
+                        *(uint32_t*)ack = BC_ACQUIRE_DONE;
+                        memcpy(ack + 4, &ptr,    sizeof(binder_uintptr_t));
+                        memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
+                        send_bc(ack, sizeof(ack), NULL, 0, NULL);
+                    }
+                    break;
+                }
                 default:
                     log_fmt("unknown cmd 0x%x at offset %d", cmd, (int)(rp - 4 - rbuf));
-                    /* skip rest */
-                    rp = rend;
+                    /* Skip 8 bytes of payload and continue */
+                    {
+                        int skip = 8;
+                        const uint8_t* next = rp + skip;
+                        if (next > rend) next = rend;
+                        rp = next;
+                    }
                     break;
             }
         }

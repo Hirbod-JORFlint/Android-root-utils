@@ -108,6 +108,32 @@ if [ -z "$PROXY_PID" ]; then
     log "Proxy failed to start"
 fi
 
+# Wait for netproxy to register with ServiceManager
+REG_OK=0
+for RTRY in 1 2 3; do
+    sleep 3
+    if grep -q "registered '" "$LOG" 2>/dev/null; then
+        REG_OK=1
+        log "Netproxy registered with ServiceManager (attempt $RTRY)"
+        break
+    fi
+    if grep -q "WARNING:" "$LOG" 2>/dev/null; then
+        log "Netproxy registration failed, retrying..."
+        kill -9 "$PROXY_PID" 2>/dev/null
+        PROXY_PID=$(start_nproxy "$TARGET_BIN")
+    fi
+done
+
+if [ "$REG_OK" -eq 0 ]; then
+    log "WARNING: Netproxy NOT registered after $RTRY attempts"
+    log "  Traffic indicator may still show 0"
+    log "  Last log lines:"
+    tail -5 "$LOG" 2>/dev/null | while IFS= read -r l; do log "  $l"; done
+    echo "REG_FAILED" > /data/local/tmp/netproxy_reg_status 2>/dev/null
+else
+    echo "REG_OK" > /data/local/tmp/netproxy_reg_status 2>/dev/null
+fi
+
 # Settings
 settings put global restricted_networking_mode 0 2>/dev/null
 
@@ -133,6 +159,10 @@ sleep 8
 SYSUI_PID=$(pidof com.android.systemui 2>/dev/null)
 log "SystemUI running as pid=$SYSUI_PID"
 
+if [ "$REG_OK" -eq 0 ]; then
+    log "WARNING: netproxy NOT registered. Consider trying the full module with BPF restoration."
+fi
+
 log "=== service-lite.sh complete ==="
 
 # Watchdog
@@ -145,5 +175,19 @@ while true; do
     if ! pidof netproxy > /dev/null 2>&1; then
         log "[WD] Proxy died restarting..."
         PROXY_PID=$(start_nproxy "$TARGET_BIN")
+        REG_OK=0
+        for RTRY in 1 2 3; do
+            sleep 3
+            if grep -q "registered '" "$LOG" 2>/dev/null; then
+                REG_OK=1
+                log "[WD] Netproxy registered (attempt $RTRY)"
+                # Restart SystemUI to pick up new registration
+                killall -9 com.android.systemui 2>/dev/null || true
+                break
+            fi
+        done
+        if [ "$REG_OK" -eq 0 ]; then
+            log "[WD] Netproxy still NOT registered after restart"
+        fi
     fi
 done

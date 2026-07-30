@@ -337,9 +337,9 @@ if [ "$BPF_STATS_OK" -eq 0 ]; then
         # Check if proxy registered successfully
         if [ -n "$NPROXY_PID" ]; then
             sleep 2
-            if grep -q "registered with ServiceManager" "$LOG" 2>/dev/null; then
+            if grep -q "registered '" "$LOG" 2>/dev/null; then
                 _log "Netproxy registered in ServiceManager"
-            elif grep -q "WARNING:.*ServiceManager" "$LOG" 2>/dev/null; then
+            elif grep -q "WARNING:" "$LOG" 2>/dev/null; then
                 _log "Netproxy registration failed (continuing anyway)"
             fi
         fi
