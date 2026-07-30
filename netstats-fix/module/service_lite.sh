@@ -2,7 +2,7 @@
 MODDIR=${0%/*}
 LOG=/data/local/tmp/netproxy.log
 
-log() { echo "$(date) [service-lite] $*" >> "$LOG"; }
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [service-lite] $*" >> "$LOG"; }
 
 find_netproxy() {
     local probe
@@ -84,9 +84,12 @@ apply_sepolicy() {
     "$MP" --live "allow domain servicemanager:binder { call transfer }" 2>/dev/null
     "$MP" --live "allow domain servicemanager:service_manager { find add }" 2>/dev/null
     "$MP" --live "allow domain netstats_service:service_manager { add }" 2>/dev/null
+    "$MP" --live "allow domain default_android_service:service_manager { add find }" 2>/dev/null
     "$MP" --live "allow domain netd:fd use" 2>/dev/null
     "$MP" --live "allow system_server proc_net:file { read open getattr }" 2>/dev/null
     "$MP" --live "allow system_server proc_net:dir { read search open }" 2>/dev/null
+    "$MP" --live "allow system_app proc_net:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow platform_app proc_net:file { read open getattr }" 2>/dev/null
     "$MP" --live "allow * * service_manager { add find }" 2>/dev/null
     log "SELinux policies applied"
 }
@@ -133,9 +136,6 @@ for RTRY in 1 2 3 4 5; do
         PROXY_PID=$(start_nproxy "$TARGET_BIN")
         continue
     fi
-    if grep -q "WARNING:" "$LOG" 2>/dev/null; then
-        log "Registration still pending, retrying..."
-    fi
     apply_sepolicy
 done
 
@@ -163,12 +163,17 @@ done
 settings put global netstats_enabled 1 2>/dev/null
 cmd netstats force-refresh 2>/dev/null || true
 
-sleep 3
-am force-stop com.android.systemui 2>/dev/null
-log "SystemUI killed"
-sleep 8
-SYSUI_PID=$(pidof com.android.systemui 2>/dev/null)
-log "SystemUI running as pid=$SYSUI_PID"
+# Only restart SystemUI if proxy registered (avoids boot loops)
+if [ "$REG_OK" -eq 1 ]; then
+    sleep 3
+    am force-stop com.android.systemui 2>/dev/null
+    log "SystemUI killed"
+    sleep 8
+    SYSUI_PID=$(pidof com.android.systemui 2>/dev/null)
+    log "SystemUI running as pid=$SYSUI_PID"
+else
+    log "Skipping SystemUI restart (proxy not registered)"
+fi
 
 if [ "$REG_OK" -eq 0 ]; then
     log "WARNING: netproxy NOT registered."

@@ -58,7 +58,6 @@ function Build-ModuleZip {
 
     Remove-Item -Path $OutputZip -ErrorAction SilentlyContinue
 
-    # Build list of files relative to tmpDir with forward slashes
     $fileList = @()
     Get-ChildItem -Path $tmpDir -Recurse -File | ForEach-Object {
         $rel = $_.FullName.Substring($tmpDir.Length).TrimStart('\')
@@ -83,14 +82,14 @@ function Build-ModuleZip {
 }
 
 Write-Output "Building full module..."
-Build-ModuleZip -OutputZip "$Out\netstats-fix-v11.zip" -TempSuffix "full" -Customize {
+Build-ModuleZip -OutputZip "$Out\netstats-fix-v13.zip" -TempSuffix "full" -Customize {
     Remove-Item "$tmpDir\service_lite.sh" -Force -ErrorAction SilentlyContinue
     Remove-Item "$tmpDir\post-fs-data_lite.sh" -Force -ErrorAction SilentlyContinue
     Remove-Item "$tmpDir\module_lite.prop" -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output "Building lite module..."
-Build-ModuleZip -OutputZip "$Out\netstats-fix-v11-lite.zip" -TempSuffix "lite" -Customize {
+Build-ModuleZip -OutputZip "$Out\netstats-fix-v13-lite.zip" -TempSuffix "lite" -Customize {
     Remove-Item "$tmpDir\service.sh", "$tmpDir\post-fs-data.sh", "$tmpDir\module.prop" -Force -ErrorAction SilentlyContinue
     Move-Item "$tmpDir\service_lite.sh" "$tmpDir\service.sh" -Force
     Move-Item "$tmpDir\post-fs-data_lite.sh" "$tmpDir\post-fs-data.sh" -Force
@@ -99,5 +98,5 @@ Build-ModuleZip -OutputZip "$Out\netstats-fix-v11-lite.zip" -TempSuffix "lite" -
 
 Write-Output ""
 Write-Output "Done! Modules built:"
-Write-Output "  $Out\netstats-fix-v11.zip"
-Write-Output "  $Out\netstats-fix-v11-lite.zip"
+Write-Output "  $Out\netstats-fix-v13.zip"
+Write-Output "  $Out\netstats-fix-v13-lite.zip"

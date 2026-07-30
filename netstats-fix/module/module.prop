@@ -1,6 +1,6 @@
 id=netstats-fix
 name=Network Stats Fix for GSI
-version=v12
-versionCode=12
+version=v13
+versionCode=13
 author=Hirbod-JORFlint
-description=Universal fix for broken traffic indicator on Android GSIs. (1) BPF repair via kver_override + bpfloader restart, (2) Native binder proxy (v4.0) reading /proc/net/dev directly with fixed flat_binder_object for protocol v8, (3) Comprehensive SELinux policy with netstats_service targeting, (4) Stub bpfloader detection, (5) Watchdog monitoring. Handles system, system_axion, system_infinity variants.
+description=Universal fix for broken traffic indicator on Android GSIs. (1) BPF repair via kver_override + bpfloader restart with APEX fallback, (2) Native binder proxy (v5.0) with dual check strategy for broader compatibility, (3) Comprehensive SELinux policy with per-device handling, (4) Stub bpfloader detection and real bpfloader discovery, (5) Netstats file fallback for devices where BPF/netproxy fail, (6) Watchdog monitoring. Handles system, system_axion, system_infinity variants. Safe for all devices - no boot loops.

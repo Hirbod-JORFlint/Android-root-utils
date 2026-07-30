@@ -22,6 +22,10 @@ allow system_app proc_net:file { read open getattr };
 allow system_app proc_net:dir { read search open };
 allow platform_app proc_net:file { read open getattr };
 allow platform_app proc_net:dir { read search open };
+allow system_server proc_net:file { read open getattr };
+allow system_server proc_net:dir { read search open };
+allow system_background proc_net:file { read open getattr };
+allow system_background proc_net:dir { read search open };
 
 # === bpfloader execution (all possible contexts) ===
 allow init bpfloader_exec:file { getattr open read execute execute_no_trans };
@@ -30,6 +34,8 @@ allow init apex_file:file { getattr open read execute execute_no_trans };
 allow init apex_exec:file { getattr open read execute execute_no_trans };
 allow init system_file:file { getattr open read execute execute_no_trans };
 allow init debug_ramdisk_file:file { getattr open read execute execute_no_trans };
+allow init mnt_expand_file:file { getattr open read execute execute_no_trans };
+allow init apex_data_file:file { getattr open read execute execute_no_trans };
 
 # === bpfloader SELinux domain permissions ===
 allow bpfloader self:capability { sys_ptrace sys_admin net_admin };
@@ -51,6 +57,9 @@ allow bpfloader tmpfs:file { read write open };
 allow bpfloader tmpfs:dir { search read write add_name create };
 allow bpfloader unlabeled:dir { search read };
 allow bpfloader unlabeled:file { read open getattr };
+allow bpfloader apex_file:file { getattr open read execute execute_no_trans };
+allow bpfloader apex_exec:file { getattr open read execute execute_no_trans };
+allow bpfloader mnt_expand_file:file { getattr open read execute execute_no_trans };
 
 # === netd permissions for BPF maps ===
 allow netd self:capability { sys_admin net_admin };
@@ -90,10 +99,6 @@ allow magisk sysfs_bpf:file { read open getattr };
 allow magisk sysfs_bpf:dir { read search open };
 allow magisk netstats_service:service_manager { add find };
 
-# === system_background for stats collection ===
-allow system_background proc_net:file { read open getattr };
-allow system_background proc_net:dir { read search open };
-
 # === crash_dump / dumpstate (for diagnostics) ===
 allow crash_dump bpfloader:process { ptrace };
 allow dumpstate bpfloader:process { ptrace };
@@ -102,6 +107,6 @@ allow dumpstate bpfloader:process { ptrace };
 allow shell proc_net:file { read open getattr };
 allow shell proc_net:dir { read search open };
 
-# === allow all domains to read /proc/net/dev (broad but safe) ===
+# === Allow all domains to read /proc/net/dev (broad but safe) ===
 allow domain proc_net:file { read open getattr };
 allow domain proc_net:dir { read search open };

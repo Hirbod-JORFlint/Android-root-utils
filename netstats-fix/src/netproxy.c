@@ -7,18 +7,22 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <dirent.h>
 #include <linux/android/binder.h>
 
 #define LOGFILE "/data/local/tmp/netproxy.log"
 #define STATSFILE "/data/local/tmp/netproxy_stats"
 #define REGFILE "/data/local/tmp/netproxy_registered"
-#define NETPROXY_VERSION "4.0"
+#define NETPROXY_VERSION "5.0"
 
 static void log_msg(const char* msg) {
     FILE* f = fopen(LOGFILE, "a");
@@ -50,46 +54,13 @@ static void log_fmt(const char* fmt, ...) {
     log_msg(buf);
 }
 
-static void write_uint32(uint8_t** p, uint32_t v) {
-    memcpy(*p, &v, 4); *p += 4;
-}
-static void write_uint64(uint8_t** p, uint64_t v) {
-    memcpy(*p, &v, 8); *p += 8;
-}
-static uint32_t read_uint32(const uint8_t** p) {
-    uint32_t v; memcpy(&v, *p, 4); *p += 4; return v;
-}
-static uint64_t read_uint64(const uint8_t** p) {
-    uint64_t v; memcpy(&v, *p, 8); *p += 8; return v;
-}
-static void align4(uint8_t** p) {
-    while ((uintptr_t)(*p) % 4 != 0) { **p = 0; (*p)++; }
-}
-static void align4_const(const uint8_t** p) {
-    while ((uintptr_t)(*p) % 4 != 0) (*p)++;
-}
-
-static void write_string16(uint8_t** buf, const char* s) {
-    size_t len = strlen(s);
-    write_uint32(buf, (uint32_t)len);
-    for (size_t i = 0; i < len; i++) {
-        uint16_t c = (uint16_t)(unsigned char)s[i];
-        memcpy(*buf, &c, 2); *buf += 2;
-    }
-    uint16_t nul = 0;
-    memcpy(*buf, &nul, 2); *buf += 2;
-    align4(buf);
-}
-
-static void skip_string16(const uint8_t** pp) {
-    uint32_t len = read_uint32(pp);
-    if (len == 0xFFFFFFFFu) return;
-    *pp += (len + 1) * 2;
-    align4_const(pp);
-}
-
 struct net_stats {
     uint64_t rxBytes, rxPackets, txBytes, txPackets;
+};
+
+struct per_iface_stats {
+    char iface[64];
+    struct net_stats stats;
 };
 
 static int read_iface_stats(const char* iface, struct net_stats* out) {
@@ -155,6 +126,44 @@ static int read_all_stats(struct net_stats* out) {
     return 0;
 }
 
+static int read_iface_list(struct per_iface_stats* out, int max_ifaces) {
+    int count = 0;
+    FILE* f = fopen("/proc/net/dev", "r");
+    if (!f) return 0;
+    char line[512];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; }
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; }
+    while (fgets(line, sizeof(line), f) && count < max_ifaces) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "lo:", 3) == 0) continue;
+        char* colon = strchr(p, ':');
+        if (!colon) continue;
+        size_t iflen = (size_t)(colon - p);
+        if (iflen >= sizeof(out[0].iface)) iflen = sizeof(out[0].iface) - 1;
+        memcpy(out[count].iface, p, iflen);
+        out[count].iface[iflen] = '\0';
+        memset(&out[count].stats, 0, sizeof(out[count].stats));
+        char* vals = colon + 1;
+        int col = 0;
+        char* saveptr;
+        char* tok = strtok_r(vals, " \t\n\r", &saveptr);
+        while (tok) {
+            uint64_t v = strtoull(tok, NULL, 10);
+            if      (col == 0) out[count].stats.rxBytes   = v;
+            else if (col == 1) out[count].stats.rxPackets  = v;
+            else if (col == 8) out[count].stats.txBytes    = v;
+            else if (col == 9) out[count].stats.txPackets  = v;
+            col++;
+            if (col > 9) break;
+            tok = strtok_r(NULL, " \t\n\r", &saveptr);
+        }
+        count++;
+    }
+    fclose(f);
+    return count;
+}
+
 static void update_stats_file(void) {
     struct net_stats s;
     if (read_all_stats(&s) != 0) return;
@@ -168,6 +177,10 @@ static void update_stats_file(void) {
     fclose(f);
     chmod(STATSFILE, 0644);
 }
+
+/* ============================================================
+ * Binder IPC - simplified and more compatible approach
+ * ============================================================ */
 
 #define BINDER_MMAP_SIZE (1 * 1024 * 1024)
 #define BINDER_BUF_SIZE  (16 * 1024)
@@ -201,9 +214,6 @@ static int open_binder(void) {
     log_fmt("binder protocol version %d", ver.protocol_version);
 
     use_new_fbo = (ver.protocol_version >= 8);
-    log_fmt("using %s flat_binder_object format (ver=%d)",
-            use_new_fbo ? "24-byte (new)" : "28-byte (legacy)",
-            ver.protocol_version);
 
     uint32_t max_threads = 8;
     ioctl(binder_fd, BINDER_SET_MAX_THREADS, &max_threads);
@@ -229,16 +239,27 @@ static void free_binder_buf(binder_uintptr_t buf_ptr) {
     uint8_t fcmd[4 + sizeof(binder_uintptr_t)];
     *(uint32_t*)fcmd = BC_FREE_BUFFER;
     memcpy(fcmd + 4, &buf_ptr, sizeof(binder_uintptr_t));
-    struct binder_write_read fbwr;
-    memset(&fbwr, 0, sizeof(fbwr));
-    fbwr.write_size = sizeof(fcmd);
-    fbwr.write_buffer = (binder_uintptr_t)(uintptr_t)fcmd;
-    ioctl(binder_fd, BINDER_WRITE_READ, &fbwr);
+    struct binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size = sizeof(fcmd);
+    bwr.write_buffer = (binder_uintptr_t)(uintptr_t)fcmd;
+    ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
 }
 
-static int send_bc(const uint8_t* write_buf, size_t write_size,
-                   uint8_t* read_buf, size_t read_size,
-                   size_t* read_consumed) {
+static int send_binder_cmd(const uint8_t* cmd, size_t cmd_size) {
+    struct binder_write_read bwr;
+    memset(&bwr, 0, sizeof(bwr));
+    bwr.write_size   = cmd_size;
+    bwr.write_buffer = (binder_uintptr_t)(uintptr_t)cmd;
+    bwr.read_size    = 0;
+    bwr.read_buffer  = 0;
+    int ret = ioctl(binder_fd, BINDER_WRITE_READ, &bwr);
+    return ret;
+}
+
+static int send_bc_with_reply(const uint8_t* write_buf, size_t write_size,
+                               uint8_t* read_buf, size_t read_size,
+                               size_t* read_consumed) {
     struct binder_write_read bwr;
     memset(&bwr, 0, sizeof(bwr));
     bwr.write_size   = write_size;
@@ -251,14 +272,79 @@ static int send_bc(const uint8_t* write_buf, size_t write_size,
     return 0;
 }
 
-static int do_transaction(uint32_t handle, uint32_t code,
-                          const uint8_t* data, size_t data_size,
-                          uint32_t* offsets, size_t offsets_count,
-                          uint8_t* out_reply, size_t out_reply_cap,
-                          size_t* out_reply_size) {
-    size_t offsets_bytes = offsets_count * sizeof(uint32_t);
-    size_t wbuf_needed = 4 + sizeof(struct binder_transaction_data) + data_size + offsets_bytes + 64;
-    uint8_t* wbuf = (uint8_t*)calloc(1, wbuf_needed);
+static int enter_looper(void) {
+    uint32_t cmd = BC_ENTER_LOOPER;
+    int ret = send_binder_cmd((const uint8_t*)&cmd, sizeof(cmd));
+    if (ret < 0) {
+        log_errno("enter_looper send_bc");
+        return -1;
+    }
+    log_msg("BC_ENTER_LOOPER sent");
+    return 0;
+}
+
+/* String helpers - writeUTF16AsNeeded for Android parcel format */
+static void write_parcel_string16(uint8_t** buf, const char* s) {
+    uint32_t len = (uint32_t)strlen(s);
+    memcpy(*buf, &len, 4); *buf += 4;
+    for (uint32_t i = 0; i < len; i++) {
+        uint16_t c = (uint16_t)(unsigned char)s[i];
+        memcpy(*buf, &c, 2); *buf += 2;
+    }
+    uint16_t nul = 0;
+    memcpy(*buf, &nul, 2); *buf += 2;
+    /* Align to 4 bytes */
+    while ((uintptr_t)(*buf) % 4 != 0) { **buf = 0; (*buf)++; }
+}
+
+/* Skip a parcel string16 in read buffer */
+static void skip_parcel_string16(const uint8_t** pp) {
+    uint32_t len;
+    memcpy(&len, *pp, 4); *pp += 4;
+    if (len == 0xFFFFFFFFu) return;
+    *pp += (len + 1) * 2;
+    while ((uintptr_t)(*pp) % 4 != 0) (*pp)++;
+}
+
+static uint32_t read_uint32(const uint8_t** p) {
+    uint32_t v; memcpy(&v, *p, 4); *p += 4; return v;
+}
+static uint64_t read_uint64(const uint8_t** p) {
+    uint64_t v; memcpy(&v, *p, 8); *p += 8; return v;
+}
+
+/* ============================================================
+ * ServiceManager registration with multiple strategies
+ * ============================================================ */
+
+#define SM_HANDLE          0
+#define SM_CHECK_SERVICE   1
+#define SM_ADD_SERVICE     3
+
+/* Strategy 1: Standard AOSP format (what service call uses) */
+static int check_service_sm1(const char* name) {
+    uint8_t pbuf[1024];
+    memset(pbuf, 0, sizeof(pbuf));
+    uint8_t* p = pbuf;
+
+    /* Exception code */
+    *(uint32_t*)p = 0; p += 4;
+
+    /* Interface descriptor */
+    write_parcel_string16(&p, "android.os.IServiceManager");
+
+    /* Service name */
+    write_parcel_string16(&p, name);
+
+    size_t psize = (size_t)(p - pbuf);
+
+    uint8_t rbuf[512];
+    memset(rbuf, 0, sizeof(rbuf));
+    size_t consumed = 0;
+
+    /* Build BC_TRANSACTION */
+    size_t wsize = 4 + sizeof(struct binder_transaction_data) + psize + 64;
+    uint8_t* wbuf = (uint8_t*)calloc(1, wsize);
     if (!wbuf) return -1;
 
     uint8_t* wp = wbuf;
@@ -268,214 +354,243 @@ static int do_transaction(uint32_t handle, uint32_t code,
     memset(tr, 0, sizeof(*tr));
     wp += sizeof(*tr);
 
-    tr->target.handle = handle;
-    tr->code          = code;
+    tr->target.handle = SM_HANDLE;
+    tr->code          = SM_CHECK_SERVICE;
     tr->flags         = TF_ACCEPT_FDS;
-    tr->data_size     = (binder_size_t)data_size;
-    tr->offsets_size  = (binder_size_t)offsets_bytes;
+    tr->data_size     = (binder_size_t)psize;
+    tr->offsets_size  = 0;
+    tr->data.ptr.buffer  = (binder_uintptr_t)(uintptr_t)wp;
+    tr->data.ptr.offsets = 0;
 
-    uint8_t* data_start = wp;
-    memcpy(wp, data, data_size); wp += data_size;
-    if (offsets && offsets_bytes) {
-        memcpy(wp, offsets, offsets_bytes); wp += offsets_bytes;
-    }
-    tr->data.ptr.buffer  = (binder_uintptr_t)(uintptr_t)data_start;
-    tr->data.ptr.offsets = (binder_uintptr_t)(uintptr_t)(data_start + data_size);
+    memcpy(wp, pbuf, psize);
 
-    size_t write_len = (size_t)(wp - wbuf);
+    int ret = send_bc_with_reply(wbuf, (size_t)(wp + psize - wbuf),
+                                  rbuf, sizeof(rbuf), &consumed);
+    free(wbuf);
 
-    uint8_t* rbuf = (uint8_t*)calloc(1, out_reply_cap + 256);
-    if (!rbuf) { free(wbuf); return -1; }
-
-    int got_reply = 0;
-    int attempt   = 0;
-
-    while (!got_reply && attempt < 32) {
-        attempt++;
-        size_t consumed = 0;
-        int ret;
-
-        if (!got_reply && write_len > 0) {
-            ret = send_bc(wbuf, write_len, rbuf, out_reply_cap + 256, &consumed);
-            write_len = 0;
-        } else {
-            ret = send_bc(NULL, 0, rbuf, out_reply_cap + 256, &consumed);
-        }
-
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            log_errno("transaction send_bc");
-            free(wbuf); free(rbuf);
-            return -1;
-        }
-
-        const uint8_t* rp   = rbuf;
-        const uint8_t* rend = rbuf + consumed;
-
-        while (rp < rend) {
-            if (rp + 4 > rend) break;
-            uint32_t cmd = *(const uint32_t*)rp; rp += 4;
-            switch (cmd) {
-                case BR_NOOP:
-                case BR_TRANSACTION_COMPLETE:
-                case BR_FINISHED:
-                case BR_FROZEN_REPLY:
-                case BR_ONEWAY_SPAM_SUSPECT:
-                case BR_TRANSACTION_PENDING_FROZEN:
-                    break;
-                case BR_SPAWN_LOOPER: {
-                    uint32_t c = BC_ENTER_LOOPER;
-                    send_bc((const uint8_t*)&c, sizeof(c), NULL, 0, NULL);
-                    break;
-                }
-                case BR_ACQUIRE_RESULT:
-                    if (rp + 4 <= rend) rp += 4;
-                    break;
-                case BR_ATTEMPT_ACQUIRE: {
-                    if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
-                        binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
-                        binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
-                        uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
-                        *(uint32_t*)ack = BC_ACQUIRE_DONE;
-                        memcpy(ack + 4, &ptr,    sizeof(binder_uintptr_t));
-                        memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
-                        send_bc(ack, sizeof(ack), NULL, 0, NULL);
-                    }
-                    break;
-                }
-                case BR_REPLY: {
-                    if (rp + sizeof(struct binder_transaction_data) > rend) {
-                        goto done_parse;
-                    }
-                    const struct binder_transaction_data* rtr =
-                        (const struct binder_transaction_data*)rp;
-                    rp += sizeof(*rtr);
-                    if (out_reply && rtr->data_size > 0) {
-                        size_t copy = rtr->data_size < out_reply_cap ? rtr->data_size : out_reply_cap;
-                        memcpy(out_reply, (const void*)(uintptr_t)rtr->data.ptr.buffer, copy);
-                        if (out_reply_size) *out_reply_size = copy;
-                    } else if (out_reply_size) {
-                        *out_reply_size = 0;
-                    }
-                    free_binder_buf(rtr->data.ptr.buffer);
-                    got_reply = 1;
-                    goto done_parse;
-                }
-                case BR_ACQUIRE:
-                case BR_INCREFS: {
-                    if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
-                        binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
-                        binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
-                        uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
-                        *(uint32_t*)ack = (cmd == BR_ACQUIRE) ? BC_ACQUIRE_DONE : BC_INCREFS_DONE;
-                        memcpy(ack + 4, &ptr,    sizeof(binder_uintptr_t));
-                        memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
-                        send_bc(ack, sizeof(ack), NULL, 0, NULL);
-                    }
-                    break;
-                }
-                case BR_RELEASE:
-                case BR_DECREFS:
-                    if (rp + sizeof(binder_uintptr_t) * 2 <= rend)
-                        rp += sizeof(binder_uintptr_t) * 2;
-                    break;
-                case BR_DEAD_BINDER:
-                case BR_CLEAR_DEATH_NOTIFICATION_DONE:
-                    if (rp + sizeof(binder_uintptr_t) <= rend)
-                        rp += sizeof(binder_uintptr_t);
-                    break;
-                case BR_FAILED_REPLY: {
-                    log_msg("BR_FAILED_REPLY in transaction (ServiceManager rejected)");
-                    free(wbuf); free(rbuf);
-                    return -1;
-                }
-                case BR_DEAD_REPLY:
-                    log_msg("BR_DEAD_REPLY in transaction");
-                    free(wbuf); free(rbuf);
-                    return -1;
-                case BR_ERROR: {
-                    int32_t err = 0;
-                    if (rp + 4 <= rend) { memcpy(&err, rp, 4); rp += 4; }
-                    log_fmt("BR_ERROR in transaction: %d", err);
-                    free(wbuf); free(rbuf);
-                    return -1;
-                }
-                default:
-                    {
-                        int skip = 8;
-                        const uint8_t* next = rp + skip;
-                        if (next > rend) next = rend;
-                        rp = next;
-                    }
-                    break;
-            }
-        }
-        done_parse:;
-    }
-
-    free(wbuf); free(rbuf);
-    return got_reply ? 0 : -1;
-}
-
-static int enter_looper(void) {
-    uint32_t cmd = BC_ENTER_LOOPER;
-    int ret = send_bc((const uint8_t*)&cmd, sizeof(cmd), NULL, 0, NULL);
     if (ret < 0) {
-        log_errno("enter_looper send_bc");
+        log_fmt("SM1 check '%s': send failed errno=%d", name, errno);
         return -1;
     }
-    log_msg("BC_ENTER_LOOPER sent");
-    return 0;
+
+    /* Parse reply */
+    const uint8_t* rp = rbuf;
+    const uint8_t* rend = rbuf + consumed;
+    while (rp < rend) {
+        if (rp + 4 > rend) break;
+        uint32_t cmd = *(const uint32_t*)rp; rp += 4;
+        switch (cmd) {
+            case BR_NOOP:
+            case BR_TRANSACTION_COMPLETE:
+            case BR_FINISHED:
+                break;
+            case BR_SPAWN_LOOPER: {
+                uint32_t c = BC_ENTER_LOOPER;
+                send_binder_cmd((const uint8_t*)&c, sizeof(c));
+                break;
+            }
+            case BR_REPLY: {
+                if (rp + sizeof(struct binder_transaction_data) > rend) goto done;
+                const struct binder_transaction_data* rtr =
+                    (const struct binder_transaction_data*)rp;
+                rp += sizeof(*rtr);
+                if (rtr->data_size >= 8) {
+                    const uint8_t* data = (const uint8_t*)(uintptr_t)rtr->data.ptr.buffer;
+                    uint32_t exc = *(const uint32_t*)data;
+                    if (exc == 0) {
+                        uint32_t has = *(const uint32_t*)(data + 4);
+                        free_binder_buf(rtr->data.ptr.buffer);
+                        if (has != 0) {
+                            log_fmt("SM1 '%s': service EXISTS", name);
+                            return 1;
+                        }
+                        log_fmt("SM1 '%s': not found", name);
+                        return 0;
+                    }
+                    free_binder_buf(rtr->data.ptr.buffer);
+                    log_fmt("SM1 '%s': exception %u", name, exc);
+                    return 0;
+                }
+                free_binder_buf(rtr->data.ptr.buffer);
+                goto done;
+            }
+            case BR_ACQUIRE:
+            case BR_INCREFS: {
+                if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
+                    binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                    binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                    uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
+                    *(uint32_t*)ack = (cmd == BR_ACQUIRE) ? BC_ACQUIRE_DONE : BC_INCREFS_DONE;
+                    memcpy(ack + 4, &ptr, sizeof(binder_uintptr_t));
+                    memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
+                    send_binder_cmd(ack, sizeof(ack));
+                }
+                break;
+            }
+            case BR_RELEASE:
+            case BR_DECREFS:
+                if (rp + sizeof(binder_uintptr_t) * 2 <= rend)
+                    rp += sizeof(binder_uintptr_t) * 2;
+                break;
+            case BR_DEAD_BINDER:
+            case BR_CLEAR_DEATH_NOTIFICATION_DONE:
+                if (rp + sizeof(binder_uintptr_t) <= rend)
+                    rp += sizeof(binder_uintptr_t);
+                break;
+            case BR_FAILED_REPLY:
+                log_fmt("SM1 '%s': BR_FAILED_REPLY", name);
+                goto done;
+            case BR_DEAD_REPLY:
+                log_fmt("SM1 '%s': BR_DEAD_REPLY", name);
+                goto done;
+            case BR_ERROR: {
+                int32_t err = 0;
+                if (rp + 4 <= rend) memcpy(&err, rp, 4);
+                log_fmt("SM1 '%s': BR_ERROR %d", name, err);
+                goto done;
+            }
+            default:
+                goto done;
+        }
+    }
+done:
+    return -1;
 }
 
-#define SM_HANDLE          0
-#define SM_CHECK_SERVICE   1
-#define SM_ADD_SERVICE     3
-
-static const char* SERVICE_NAMES[] = {
-    "netstats",
-    "netstats_service",
-    "network_stats",
-    NULL
-};
-
-static int check_service_exists(const char* name) {
+/* Strategy 2: No offsets (for check_service) - sometimes required */
+static int check_service_sm2(const char* name) {
     uint8_t pbuf[1024];
     memset(pbuf, 0, sizeof(pbuf));
     uint8_t* p = pbuf;
 
-    write_uint32(&p, 0);
-    write_string16(&p, "android.os.IServiceManager");
-    write_string16(&p, name);
+    /* No explicit exception prefix - just interface + name */
+    write_parcel_string16(&p, "android.os.IServiceManager");
+    write_parcel_string16(&p, name);
 
     size_t psize = (size_t)(p - pbuf);
 
-    uint8_t reply[256];
-    size_t reply_size = 0;
-    int ret = do_transaction(SM_HANDLE, SM_CHECK_SERVICE,
-                             pbuf, psize,
-                             NULL, 0,
-                             reply, sizeof(reply), &reply_size);
+    uint8_t rbuf[512];
+    memset(rbuf, 0, sizeof(rbuf));
+    size_t consumed = 0;
+
+    size_t wsize = 4 + sizeof(struct binder_transaction_data) + psize + 64;
+    uint8_t* wbuf = (uint8_t*)calloc(1, wsize);
+    if (!wbuf) return -1;
+
+    uint8_t* wp = wbuf;
+    *(uint32_t*)wp = BC_TRANSACTION; wp += 4;
+
+    struct binder_transaction_data* tr = (struct binder_transaction_data*)wp;
+    memset(tr, 0, sizeof(*tr));
+    wp += sizeof(*tr);
+
+    tr->target.handle = SM_HANDLE;
+    tr->code          = SM_CHECK_SERVICE;
+    tr->flags         = TF_ACCEPT_FDS;
+    tr->data_size     = (binder_size_t)psize;
+    tr->offsets_size  = 0;
+
+    uint8_t* data_buf = wp;
+    memcpy(data_buf, pbuf, psize);
+    tr->data.ptr.buffer  = (binder_uintptr_t)(uintptr_t)data_buf;
+    tr->data.ptr.offsets = 0;
+
+    size_t total = (size_t)(data_buf + psize - wbuf);
+    int ret = send_bc_with_reply(wbuf, total, rbuf, sizeof(rbuf), &consumed);
+    free(wbuf);
+
     if (ret < 0) {
-        log_fmt("check '%s': transaction failed", name);
+        log_fmt("SM2 check '%s': send failed errno=%d", name, errno);
         return -1;
     }
 
-    if (reply_size >= 8) {
-        const uint8_t* rp = reply;
-        uint32_t exception = read_uint32(&rp);
-        if (exception != 0) {
-            log_fmt("check '%s': exception %u (service does not exist)", name, exception);
-            return 0;
-        }
-        uint32_t has_binder = read_uint32(&rp);
-        if (has_binder != 0) {
-            log_fmt("check '%s': service already EXISTS", name);
-            return 1;
+    const uint8_t* rp = rbuf;
+    const uint8_t* rend = rbuf + consumed;
+    while (rp < rend) {
+        if (rp + 4 > rend) break;
+        uint32_t cmd = *(const uint32_t*)rp; rp += 4;
+        switch (cmd) {
+            case BR_NOOP:
+            case BR_TRANSACTION_COMPLETE:
+            case BR_FINISHED:
+                break;
+            case BR_SPAWN_LOOPER: {
+                uint32_t c = BC_ENTER_LOOPER;
+                send_binder_cmd((const uint8_t*)&c, sizeof(c));
+                break;
+            }
+            case BR_REPLY: {
+                if (rp + sizeof(struct binder_transaction_data) > rend) goto done2;
+                const struct binder_transaction_data* rtr =
+                    (const struct binder_transaction_data*)rp;
+                rp += sizeof(*rtr);
+                if (rtr->data_size >= 8) {
+                    const uint8_t* data = (const uint8_t*)(uintptr_t)rtr->data.ptr.buffer;
+                    uint32_t exc = *(const uint32_t*)data;
+                    if (exc == 0) {
+                        uint32_t has = *(const uint32_t*)(data + 4);
+                        free_binder_buf(rtr->data.ptr.buffer);
+                        if (has != 0) {
+                            log_fmt("SM2 '%s': service EXISTS", name);
+                            return 1;
+                        }
+                        log_fmt("SM2 '%s': not found", name);
+                        return 0;
+                    }
+                    free_binder_buf(rtr->data.ptr.buffer);
+                    log_fmt("SM2 '%s': exception %u", name, exc);
+                    return 0;
+                }
+                free_binder_buf(rtr->data.ptr.buffer);
+                goto done2;
+            }
+            case BR_ACQUIRE:
+            case BR_INCREFS: {
+                if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
+                    binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                    binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                    uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
+                    *(uint32_t*)ack = (cmd == BR_ACQUIRE) ? BC_ACQUIRE_DONE : BC_INCREFS_DONE;
+                    memcpy(ack + 4, &ptr, sizeof(binder_uintptr_t));
+                    memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
+                    send_binder_cmd(ack, sizeof(ack));
+                }
+                break;
+            }
+            case BR_RELEASE:
+            case BR_DECREFS:
+                if (rp + sizeof(binder_uintptr_t) * 2 <= rend)
+                    rp += sizeof(binder_uintptr_t) * 2;
+                break;
+            case BR_DEAD_BINDER:
+            case BR_CLEAR_DEATH_NOTIFICATION_DONE:
+                if (rp + sizeof(binder_uintptr_t) <= rend)
+                    rp += sizeof(binder_uintptr_t);
+                break;
+            case BR_FAILED_REPLY:
+                log_fmt("SM2 '%s': BR_FAILED_REPLY", name);
+                goto done2;
+            case BR_DEAD_REPLY:
+                log_fmt("SM2 '%s': BR_DEAD_REPLY", name);
+                goto done2;
+            case BR_ERROR: {
+                int32_t err = 0;
+                if (rp + 4 <= rend) memcpy(&err, rp, 4);
+                log_fmt("SM2 '%s': BR_ERROR %d", name, err);
+                goto done2;
+            }
+            default:
+                goto done2;
         }
     }
-    log_fmt("check '%s': service not found", name);
-    return 0;
+done2:
+    return -1;
+}
+
+static int check_service_exists(const char* name) {
+    int r = check_service_sm1(name);
+    if (r >= 0) return r;
+    return check_service_sm2(name);
 }
 
 static int register_one_name(const char* name) {
@@ -488,16 +603,23 @@ static int register_one_name(const char* name) {
         log_fmt("check failed for '%s', trying registration anyway", name);
     }
 
+    /* Build add_service parcel */
     uint8_t pbuf[2048];
     memset(pbuf, 0, sizeof(pbuf));
     uint8_t* p = pbuf;
 
-    write_uint32(&p, 0);
-    write_string16(&p, "android.os.IServiceManager");
-    write_string16(&p, name);
+    /* Exception prefix */
+    *(uint32_t*)p = 0; p += 4;
+
+    /* Interface descriptor */
+    write_parcel_string16(&p, "android.os.IServiceManager");
+
+    /* Service name */
+    write_parcel_string16(&p, name);
 
     uint32_t fbo_offset = (uint32_t)(uintptr_t)(p - pbuf);
 
+    /* flat_binder_object */
     if (use_new_fbo) {
         struct flat_binder_object fbo;
         memset(&fbo, 0, sizeof(fbo));
@@ -505,13 +627,8 @@ static int register_one_name(const char* name) {
         fbo.flags = 0x7f | FLAT_BINDER_FLAG_ACCEPTS_FDS;
         fbo.binder = (binder_uintptr_t)(uintptr_t)binder_local_obj;
         fbo.cookie = (binder_uintptr_t)(uintptr_t)binder_local_obj;
-        if (sizeof(fbo) != 24) {
-            log_fmt("WARNING: flat_binder_object size=%zu (expected 24)", sizeof(fbo));
-        }
         memcpy(p, &fbo, sizeof(fbo)); p += sizeof(fbo);
     } else {
-#define BINDER_TYPE_BINDER_LEGACY 1
-#define FBO_FLAG_ACCEPTS_FDS_LEGACY 0x100
         struct {
             uint32_t type;
             uint32_t flags;
@@ -520,60 +637,158 @@ static int register_one_name(const char* name) {
             binder_uintptr_t cookie;
         } fbo_legacy;
         memset(&fbo_legacy, 0, sizeof(fbo_legacy));
-        fbo_legacy.type      = BINDER_TYPE_BINDER_LEGACY;
-        fbo_legacy.flags     = 0x7f | FBO_FLAG_ACCEPTS_FDS_LEGACY;
-        fbo_legacy.binder    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
-        fbo_legacy.cookie    = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+        fbo_legacy.type   = 1;
+        fbo_legacy.flags  = 0x7f | 0x100;
+        fbo_legacy.binder = (binder_uintptr_t)(uintptr_t)binder_local_obj;
+        fbo_legacy.cookie = (binder_uintptr_t)(uintptr_t)binder_local_obj;
         memcpy(p, &fbo_legacy, sizeof(fbo_legacy)); p += sizeof(fbo_legacy);
     }
 
-    write_uint32(&p, 0);
-    write_uint32(&p, 0);
+    /* int32 uid = 0 */
+    *(uint32_t*)p = 0; p += 4;
+    /* int32 flags = 0 */
+    *(uint32_t*)p = 0; p += 4;
 
     size_t   psize   = (size_t)(p - pbuf);
     uint32_t offsets[1] = { fbo_offset };
 
-    uint8_t reply[256];
-    size_t  reply_size = 0;
-    int ret = do_transaction(SM_HANDLE, SM_ADD_SERVICE,
-                             pbuf, psize,
-                             offsets, 1,
-                             reply, sizeof(reply), &reply_size);
+    /* Build BC_TRANSACTION */
+    size_t offsets_bytes = sizeof(offsets);
+    size_t wsize = 4 + sizeof(struct binder_transaction_data) + psize + offsets_bytes + 64;
+    uint8_t* wbuf = (uint8_t*)calloc(1, wsize);
+    if (!wbuf) return -1;
+
+    uint8_t* wp = wbuf;
+    *(uint32_t*)wp = BC_TRANSACTION; wp += 4;
+
+    struct binder_transaction_data* tr = (struct binder_transaction_data*)wp;
+    memset(tr, 0, sizeof(*tr));
+    wp += sizeof(*tr);
+
+    tr->target.handle = SM_HANDLE;
+    tr->code          = SM_ADD_SERVICE;
+    tr->flags         = TF_ACCEPT_FDS;
+    tr->data_size     = (binder_size_t)psize;
+    tr->offsets_size  = (binder_size_t)offsets_bytes;
+
+    uint8_t* data_start = wp;
+    memcpy(data_start, pbuf, psize);
+    memcpy(data_start + psize, offsets, offsets_bytes);
+
+    tr->data.ptr.buffer  = (binder_uintptr_t)(uintptr_t)data_start;
+    tr->data.ptr.offsets = (binder_uintptr_t)(uintptr_t)(data_start + psize);
+
+    size_t write_len = (size_t)(data_start + psize + offsets_bytes - wbuf);
+
+    uint8_t rbuf[512];
+    memset(rbuf, 0, sizeof(rbuf));
+    size_t consumed = 0;
+
+    int ret = send_bc_with_reply(wbuf, write_len, rbuf, sizeof(rbuf), &consumed);
+    free(wbuf);
+
     if (ret < 0) {
-        log_fmt("register '%s': transaction failed", name);
+        log_fmt("register '%s': send failed errno=%d", name, errno);
         return -1;
     }
 
-    if (reply_size >= 4) {
-        const uint8_t* rp = reply;
-        uint32_t exception = read_uint32(&rp);
-        if (exception != 0) {
-            log_fmt("register '%s': exception %u", name, exception);
-            return -1;
+    const uint8_t* rp = rbuf;
+    const uint8_t* rend = rbuf + consumed;
+    while (rp < rend) {
+        if (rp + 4 > rend) break;
+        uint32_t cmd = *(const uint32_t*)rp; rp += 4;
+        switch (cmd) {
+            case BR_NOOP:
+            case BR_TRANSACTION_COMPLETE:
+            case BR_FINISHED:
+                break;
+            case BR_REPLY: {
+                if (rp + sizeof(struct binder_transaction_data) > rend) goto reg_done;
+                const struct binder_transaction_data* rtr =
+                    (const struct binder_transaction_data*)rp;
+                rp += sizeof(*rtr);
+                if (rtr->data_size >= 4) {
+                    const uint8_t* data = (const uint8_t*)(uintptr_t)rtr->data.ptr.buffer;
+                    uint32_t exc = *(const uint32_t*)data;
+                    free_binder_buf(rtr->data.ptr.buffer);
+                    if (exc != 0) {
+                        log_fmt("register '%s': exception %u", name, exc);
+                        return -1;
+                    }
+                    log_fmt("registered '%s' OK", name);
+                    return 0;
+                }
+                free_binder_buf(rtr->data.ptr.buffer);
+                goto reg_done;
+            }
+            case BR_ACQUIRE:
+            case BR_INCREFS: {
+                if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
+                    binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                    binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                    uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
+                    *(uint32_t*)ack = (cmd == BR_ACQUIRE) ? BC_ACQUIRE_DONE : BC_INCREFS_DONE;
+                    memcpy(ack + 4, &ptr, sizeof(binder_uintptr_t));
+                    memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
+                    send_binder_cmd(ack, sizeof(ack));
+                }
+                break;
+            }
+            case BR_RELEASE:
+            case BR_DECREFS:
+                if (rp + sizeof(binder_uintptr_t) * 2 <= rend)
+                    rp += sizeof(binder_uintptr_t) * 2;
+                break;
+            case BR_DEAD_BINDER:
+            case BR_CLEAR_DEATH_NOTIFICATION_DONE:
+                if (rp + sizeof(binder_uintptr_t) <= rend)
+                    rp += sizeof(binder_uintptr_t);
+                break;
+            case BR_FAILED_REPLY:
+                log_fmt("register '%s': BR_FAILED_REPLY", name);
+                goto reg_done;
+            case BR_DEAD_REPLY:
+                log_fmt("register '%s': BR_DEAD_REPLY", name);
+                goto reg_done;
+            case BR_ERROR: {
+                int32_t err = 0;
+                if (rp + 4 <= rend) memcpy(&err, rp, 4);
+                log_fmt("register '%s': BR_ERROR %d", name, err);
+                goto reg_done;
+            }
+            default:
+                goto reg_done;
         }
     }
-
-    log_fmt("registered '%s' OK", name);
-    return 0;
+reg_done:
+    return -1;
 }
+
+static const char* SERVICE_NAMES[] = {
+    "netstats",
+    "netstats_service",
+    "network_stats",
+    NULL
+};
 
 static int register_with_sm(void) {
     log_msg("registering with ServiceManager...");
     int success = 0;
 
-    for (int retry = 0; retry < 3 && !success; retry++) {
+    for (int retry = 0; retry < 5 && !success; retry++) {
         for (int i = 0; SERVICE_NAMES[i]; i++) {
             if (register_one_name(SERVICE_NAMES[i]) == 0)
                 success = 1;
         }
-        if (!success && retry < 2) {
-            log_fmt("registration retry %d/2, waiting 2s...", retry + 1);
-            sleep(2);
+        if (!success && retry < 4) {
+            log_fmt("registration retry %d/4, waiting %ds...", retry + 1, 2 + retry * 2);
+            sleep(2 + retry * 2);
         }
     }
 
     if (!success) {
         log_msg("WARNING: failed to register under ANY service name");
+        log_msg("  Traffic indicator will show total traffic (no per-app)");
         unlink(REGFILE);
         return -1;
     }
@@ -585,6 +800,10 @@ static int register_with_sm(void) {
     }
     return 0;
 }
+
+/* ============================================================
+ * Binder event loop - handle incoming transactions
+ * ============================================================ */
 
 #define TX_GET_TOTAL_STATS      1
 #define TX_GET_IFACE_STATS      2
@@ -613,7 +832,7 @@ static uint64_t pick_stat(const struct net_stats* s, int type) {
 }
 
 static void write_no_exception(uint8_t** buf) {
-    write_uint32(buf, 0);
+    *(uint32_t*)*buf = 0; *buf += 4;
 }
 
 static void handle_getIfaceStats(const struct binder_transaction_data* tr,
@@ -625,29 +844,30 @@ static void handle_getIfaceStats(const struct binder_transaction_data* tr,
     const uint8_t* pend = pp + tr->data_size;
 
     if (pp + 4 <= pend) pp += 4;
-    if (pp + 4 <= pend) skip_string16(&pp);
+    if (pp + 4 <= pend) skip_parcel_string16(&pp);
 
     char iface[64];
     strncpy(iface, "wlan0", sizeof(iface));
     if (pp + 4 <= pend) {
-        uint32_t name_len = read_uint32(&pp);
+        uint32_t name_len;
+        memcpy(&name_len, pp, 4); pp += 4;
         if (name_len > 0 && name_len < 60 && pp + name_len * 2 <= pend) {
-            for (uint32_t i = 0; i < name_len; i++) {
+            for (uint32_t i = 0; i < name_len; i++)
                 iface[i] = (char)pp[i * 2];
-            }
             iface[name_len] = '\0';
             pp += (name_len + 1) * 2;
-            align4_const(&pp);
+            while ((uintptr_t)pp % 4 != 0) pp++;
         }
     }
 
     int type = TYPE_RX_BYTES;
-    if (pp + 4 <= pend) type = (int)read_uint32(&pp);
+    if (pp + 4 <= pend) { memcpy(&type, pp, 4); pp += 4; }
 
     struct net_stats s;
     if (read_iface_stats(iface, &s) != 0) read_all_stats(&s);
 
-    write_uint64(&rp, pick_stat(&s, type));
+    uint64_t val = pick_stat(&s, type);
+    memcpy(rp, &val, 8); rp += 8;
     *reply_size = (size_t)(rp - reply_buf);
 }
 
@@ -660,16 +880,15 @@ static void handle_getTotalStats(const struct binder_transaction_data* tr,
     const uint8_t* pend = pp + tr->data_size;
 
     if (pp + 4 <= pend) pp += 4;
-    if (pp + 4 <= pend) skip_string16(&pp);
+    if (pp + 4 <= pend) skip_parcel_string16(&pp);
 
     int type = TYPE_RX_BYTES;
-    if (pp + 4 <= pend) type = (int)read_uint32(&pp);
+    if (pp + 4 <= pend) { memcpy(&type, pp, 4); pp += 4; }
 
     struct net_stats s;
     read_all_stats(&s);
     uint64_t val = pick_stat(&s, type);
-    log_fmt("getTotalStats type=%d -> %llu", type, (unsigned long long)val);
-    write_uint64(&rp, val);
+    memcpy(rp, &val, 8); rp += 8;
     *reply_size = (size_t)(rp - reply_buf);
 }
 
@@ -682,26 +901,21 @@ static void handle_getDeviceSummary(const struct binder_transaction_data* tr,
     struct net_stats s;
     read_all_stats(&s);
 
-    write_uint64(&rp, 0);
-    write_uint64(&rp, s.rxBytes);
-    write_uint64(&rp, s.txBytes);
-    write_uint64(&rp, s.rxPackets);
-    write_uint64(&rp, s.txPackets);
-    write_uint64(&rp, 0);
-    write_uint32(&rp, 0);
-    write_string16(&rp, "");
+    memcpy(rp, &(uint64_t){0}, 8); rp += 8;
+    memcpy(rp, &s.rxBytes, 8); rp += 8;
+    memcpy(rp, &s.txBytes, 8); rp += 8;
+    memcpy(rp, &s.rxPackets, 8); rp += 8;
+    memcpy(rp, &s.txPackets, 8); rp += 8;
+    memcpy(rp, &(uint64_t){0}, 8); rp += 8;
+    *(uint32_t*)rp = 0; rp += 4;
 
     *reply_size = (size_t)(rp - reply_buf);
-    log_fmt("getDeviceSummary -> rx=%llu tx=%llu",
-            (unsigned long long)s.rxBytes, (unsigned long long)s.txBytes);
 }
 
 static void handle_transaction(const struct binder_transaction_data* tr) {
     uint8_t reply_data[2048];
     uint8_t* reply_rp = reply_data;
     size_t   reply_size = 0;
-
-    log_fmt("got transaction code=%u sender_pid=%u", (unsigned)tr->code, (unsigned)tr->sender_pid);
 
     switch (tr->code) {
         case TX_GET_IFACE_STATS:
@@ -716,7 +930,7 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
 
         case TX_GET_UID_STATS:
             write_no_exception(&reply_rp);
-            write_uint64(&reply_rp, 0);
+            memcpy(reply_rp, &(uint64_t){0}, 8); reply_rp += 8;
             reply_size = (size_t)(reply_rp - reply_data);
             break;
 
@@ -730,7 +944,7 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
         case TX_PING:
         case TX_PING2:
             write_no_exception(&reply_rp);
-            write_uint32(&reply_rp, 1);
+            *(uint32_t*)reply_rp = 1; reply_rp += 4;
             reply_size = (size_t)(reply_rp - reply_data);
             break;
 
@@ -747,30 +961,28 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
                 const uint8_t* pend = pp + tr->data_size;
                 if (pp + 8 <= pend) {
                     pp += 4;
-                    if (pp + 4 <= pend) skip_string16(&pp);
+                    if (pp + 4 <= pend) skip_parcel_string16(&pp);
                     if (pp + 4 <= pend) {
-                        int guessed_type = (int)read_uint32(&pp);
+                        int guessed_type;
+                        memcpy(&guessed_type, pp, 4);
                         if (guessed_type >= 0 && guessed_type <= 3) {
                             struct net_stats s;
                             read_all_stats(&s);
                             uint64_t val = pick_stat(&s, guessed_type);
                             write_no_exception(&reply_rp);
-                            write_uint64(&reply_rp, val);
+                            memcpy(reply_rp, &val, 8); reply_rp += 8;
                             reply_size = (size_t)(reply_rp - reply_data);
-                            log_fmt("code=%u guessed type=%d -> %llu",
-                                    (unsigned)tr->code, guessed_type, (unsigned long long)val);
                             break;
                         }
                     }
                 }
             }
-            log_fmt("unhandled code=%u (0x%x) sender_pid=%u, returning empty",
-                    (unsigned)tr->code, (unsigned)tr->code, (unsigned)tr->sender_pid);
             write_no_exception(&reply_rp);
             reply_size = (size_t)(reply_rp - reply_data);
             break;
     }
 
+    /* Send BC_REPLY */
     size_t rwbuf_size = 4 + sizeof(struct binder_transaction_data) + reply_size + 64;
     uint8_t* rwbuf = (uint8_t*)calloc(1, rwbuf_size);
     if (!rwbuf) return;
@@ -789,26 +1001,12 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
     rtr->data.ptr.buffer = (binder_uintptr_t)(uintptr_t)rwp;
 
     memcpy(rwp, reply_data, reply_size);
-    rwp += reply_size;
 
-    size_t write_len = (size_t)(rwp - rwbuf);
+    size_t write_len = (size_t)(rwp + reply_size - rwbuf);
     uint8_t discard[256];
-    size_t  consumed = 0;
-    int ret = send_bc(rwbuf, write_len, discard, sizeof(discard), &consumed);
-    if (ret < 0) log_errno("BC_REPLY send");
+    size_t consumed = 0;
+    send_bc_with_reply(rwbuf, write_len, discard, sizeof(discard), &consumed);
     free(rwbuf);
-}
-
-static int get_kernel_version(void) {
-    FILE* f = fopen("/proc/version", "r");
-    if (!f) return -1;
-    char line[256];
-    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
-    fclose(f);
-    int maj = 0, min = 0;
-    if (sscanf(line, "Linux version %d.%d", &maj, &min) >= 2)
-        return maj * 100 + min;
-    return -1;
 }
 
 static void run_event_loop(void) {
@@ -821,7 +1019,7 @@ static void run_event_loop(void) {
 
     while (1) {
         size_t consumed = 0;
-        int ret = send_bc(NULL, 0, rbuf, BINDER_BUF_SIZE, &consumed);
+        int ret = send_bc_with_reply(NULL, 0, rbuf, BINDER_BUF_SIZE, &consumed);
         if (ret < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             log_errno("main loop read");
@@ -840,7 +1038,8 @@ static void run_event_loop(void) {
 
         while (rp < rend) {
             if (rp + 4 > rend) break;
-            uint32_t cmd = *(const uint32_t*)rp; rp += 4;
+            uint32_t cmd;
+            memcpy(&cmd, rp, 4); rp += 4;
 
             switch (cmd) {
                 case BR_TRANSACTION: {
@@ -862,13 +1061,14 @@ static void run_event_loop(void) {
                 case BR_ACQUIRE:
                 case BR_INCREFS: {
                     if (rp + sizeof(binder_uintptr_t) * 2 > rend) goto loop_end;
-                    binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
-                    binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                    binder_uintptr_t ptr, cookie;
+                    memcpy(&ptr, rp, sizeof(binder_uintptr_t)); rp += sizeof(binder_uintptr_t);
+                    memcpy(&cookie, rp, sizeof(binder_uintptr_t)); rp += sizeof(binder_uintptr_t);
                     uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
                     *(uint32_t*)ack = (cmd == BR_ACQUIRE) ? BC_ACQUIRE_DONE : BC_INCREFS_DONE;
-                    memcpy(ack + 4,                            &ptr,    sizeof(binder_uintptr_t));
+                    memcpy(ack + 4, &ptr, sizeof(binder_uintptr_t));
                     memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
-                    send_bc(ack, sizeof(ack), NULL, 0, NULL);
+                    send_binder_cmd(ack, sizeof(ack));
                     break;
                 }
                 case BR_RELEASE:
@@ -878,7 +1078,7 @@ static void run_event_loop(void) {
                     break;
                 case BR_SPAWN_LOOPER: {
                     uint32_t c = BC_ENTER_LOOPER;
-                    send_bc((const uint8_t*)&c, sizeof(c), NULL, 0, NULL);
+                    send_binder_cmd((const uint8_t*)&c, sizeof(c));
                     break;
                 }
                 case BR_TRANSACTION_COMPLETE:
@@ -890,15 +1090,13 @@ static void run_event_loop(void) {
                         rp += sizeof(binder_uintptr_t);
                     break;
                 case BR_FAILED_REPLY:
-                    log_msg("BR_FAILED_REPLY in event loop (non-fatal)");
                     break;
                 case BR_DEAD_REPLY:
-                    log_msg("BR_DEAD_REPLY in event loop (non-fatal)");
                     break;
                 case BR_ERROR: {
                     int32_t err = 0;
-                    if (rp + 4 <= rend) { memcpy(&err, rp, 4); rp += 4; }
-                    log_fmt("BR_ERROR: %d", err);
+                    if (rp + 4 <= rend) memcpy(&err, rp, 4);
+                    rp += 4;
                     break;
                 }
                 case BR_ACQUIRE_RESULT:
@@ -911,25 +1109,16 @@ static void run_event_loop(void) {
                     break;
                 case BR_ATTEMPT_ACQUIRE: {
                     if (rp + sizeof(binder_uintptr_t) * 2 <= rend) {
-                        binder_uintptr_t ptr    = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
-                        binder_uintptr_t cookie = *(binder_uintptr_t*)rp; rp += sizeof(binder_uintptr_t);
+                        rp += sizeof(binder_uintptr_t) * 2;
                         uint8_t ack[4 + sizeof(binder_uintptr_t) * 2];
                         *(uint32_t*)ack = BC_ACQUIRE_DONE;
-                        memcpy(ack + 4, &ptr,    sizeof(binder_uintptr_t));
-                        memcpy(ack + 4 + sizeof(binder_uintptr_t), &cookie, sizeof(binder_uintptr_t));
-                        send_bc(ack, sizeof(ack), NULL, 0, NULL);
+                        memset(ack + 4, 0, sizeof(binder_uintptr_t) * 2);
+                        send_binder_cmd(ack, sizeof(ack));
                     }
                     break;
                 }
                 default:
-                    log_fmt("unknown cmd 0x%x at offset %d", cmd, (int)(rp - 4 - rbuf));
-                    {
-                        int skip = 8;
-                        const uint8_t* next = rp + skip;
-                        if (next > rend) next = rend;
-                        rp = next;
-                    }
-                    break;
+                    goto loop_end;
             }
         }
         loop_end:;
@@ -953,9 +1142,6 @@ int main(void) {
     signal(SIGTERM, sig_handler);
     signal(SIGHUP,  sig_handler);
     signal(SIGINT,  sig_handler);
-
-    int kv = get_kernel_version();
-    log_fmt("Kernel version: %d.%d", kv / 100, kv % 100);
 
     if (open_binder() < 0) {
         log_msg("FATAL: failed to open binder");

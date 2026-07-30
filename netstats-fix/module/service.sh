@@ -11,6 +11,8 @@ BPF_MAP_COOKIE="$BPF_NETD/map_netd_cookie_tag_map"
 BPF_MAP_CONFIG="$BPF_NETD/map_netd_configuration_map"
 BPF_MAP_STATS_A="$BPF_NETD/map_netd_stats_map_A"
 BPF_MAP_STATS_B="$BPF_NETD/map_netd_stats_map_B"
+STATSFILE_DIR="/data/local/tmp/netstats"
+REGFILE="/data/local/tmp/netproxy_registered"
 
 count_bpf_maps() {
     local c=0
@@ -26,9 +28,7 @@ bpf_stats_ready() {
 }
 
 stub_bpfloader_detected() {
-    local m
-    m="$BPF_NETD/mainline_done"
-    [ -d "$m" ] && [ "$(count_bpf_maps)" -eq 0 ]
+    [ -d "$BPF_NETD/mainline_done" ] && [ "$(count_bpf_maps)" -eq 0 ]
 }
 
 find_netproxy() {
@@ -76,25 +76,94 @@ apply_sepolicy() {
     [ -z "$MP" ] && { _log "magiskpolicy not found; relying on sepolicy.rule"; return 0; }
 
     _log "Applying live SELinux rules..."
+
+    # proc_net access
     "$MP" --live "allow domain proc_net:file { read open getattr }"               2>/dev/null
     "$MP" --live "allow domain proc_net:dir { read search open }"                 2>/dev/null
+
+    # Binder access
     "$MP" --live "allow domain binder_device:chr_file { read write open ioctl }"  2>/dev/null
-    "$MP" --live "allow domain servicemanager:binder { call transfer }"              2>/dev/null
-    "$MP" --live "allow domain servicemanager:service_manager { find add }"        2>/dev/null
-    "$MP" --live "allow domain netstats_service:service_manager { add }"           2>/dev/null
+    "$MP" --live "allow domain servicemanager:binder { call transfer }"            2>/dev/null
+    "$MP" --live "allow domain servicemanager:service_manager { find add }"       2>/dev/null
+    "$MP" --live "allow domain netstats_service:service_manager { add }"          2>/dev/null
+    "$MP" --live "allow domain default_android_service:service_manager { add find }" 2>/dev/null
+    "$MP" --live "allow * * service_manager { add find }"                         2>/dev/null
+
+    # System server / apps
     "$MP" --live "allow system_server proc_net:file { read open getattr }"        2>/dev/null
     "$MP" --live "allow system_server proc_net:dir { read search open }"          2>/dev/null
     "$MP" --live "allow system_app proc_net:file { read open getattr }"           2>/dev/null
     "$MP" --live "allow platform_app proc_net:file { read open getattr }"         2>/dev/null
-    "$MP" --live "allow init bpfloader_exec:file { getattr open read execute execute_no_trans }" 2>/dev/null
+    "$MP" --live "allow system_background proc_net:file { read open getattr }"    2>/dev/null
+
+    # bpfloader execution
+    "$MP" --live "allow init bpfloader_exec:file { getattr open read execute execute_no_trans }"  2>/dev/null
     "$MP" --live "allow init bpfloader_platform_exec:file { getattr open read execute execute_no_trans }" 2>/dev/null
-    "$MP" --live "allow bpfloader bpffs:dir { search read write add_name remove_name create }"   2>/dev/null
-    "$MP" --live "allow bpfloader bpffs:file { create read write open map getattr setattr }"     2>/dev/null
-    "$MP" --live "allow bpfloader proc_net:file { read open getattr }"             2>/dev/null
-    "$MP" --live "allow netd bpffs:dir { search read write add_name remove_name }" 2>/dev/null
-    "$MP" --live "allow netd bpffs:file { read write open map getattr }"           2>/dev/null
-    "$MP" --live "allow crash_dump bpfloader:process { ptrace }"                  2>/dev/null
-    "$MP" --live "allow * * service_manager { add find }"                         2>/dev/null
+    "$MP" --live "allow init apex_file:file { getattr open read execute execute_no_trans }" 2>/dev/null
+    "$MP" --live "allow init apex_exec:file { getattr open read execute execute_no_trans }" 2>/dev/null
+    "$MP" --live "allow init system_file:file { getattr open read execute execute_no_trans }" 2>/dev/null
+    "$MP" --live "allow init debug_ramdisk_file:file { getattr open read execute execute_no_trans }" 2>/dev/null
+
+    # bpfloader domain permissions
+    "$MP" --live "allow bpfloader self:capability { sys_ptrace sys_admin net_admin }" 2>/dev/null
+    "$MP" --live "allow bpfloader self:capability2 { sys_ptrace sys_admin }" 2>/dev/null
+    "$MP" --live "allow bpfloader kernel:system module_request" 2>/dev/null
+    "$MP" --live "allow bpfloader bpffs:dir { search read write add_name remove_name create rmdir setattr }" 2>/dev/null
+    "$MP" --live "allow bpfloader bpffs:file { create read write open map getattr setattr unlink }" 2>/dev/null
+    "$MP" --live "allow bpfloader bpffs:lnk_file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow bpfloader proc_net:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow bpfloader proc_net:dir { search read }" 2>/dev/null
+    "$MP" --live "allow bpfloader proc_kallsyms:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow bpfloader kmsg_device:chr_file { write }" 2>/dev/null
+    "$MP" --live "allow bpfloader sysfs_btf:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow bpfloader sysfs_btf:dir { search read }" 2>/dev/null
+    "$MP" --live "allow bpfloader sysfs:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow bpfloader sysfs:dir { search read }" 2>/dev/null
+    "$MP" --live "allow bpfloader tmpfs:file { read write open }" 2>/dev/null
+    "$MP" --live "allow bpfloader tmpfs:dir { search read write add_name create }" 2>/dev/null
+    "$MP" --live "allow bpfloader unlabeled:dir { search read }" 2>/dev/null
+    "$MP" --live "allow bpfloader unlabeled:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow bpfloader selinuxfs:file { read open getattr }" 2>/dev/null
+
+    # netd BPF access
+    "$MP" --live "allow netd self:capability { sys_admin net_admin }" 2>/dev/null
+    "$MP" --live "allow netd kernel:system module_request" 2>/dev/null
+    "$MP" --live "allow netd bpffs:dir { search read write add_name remove_name create rmdir }" 2>/dev/null
+    "$MP" --live "allow netd bpffs:file { read write open map getattr setattr }" 2>/dev/null
+    "$MP" --live "allow netd bpffs:lnk_file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow netd proc_net:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow netd proc_net:dir { search read }" 2>/dev/null
+
+    # system_server BPF
+    "$MP" --live "allow system_server self:capability { sys_admin }" 2>/dev/null
+    "$MP" --live "allow system_server bpffs:dir { read search open }" 2>/dev/null
+    "$MP" --live "allow system_server bpffs:file { read open getattr map }" 2>/dev/null
+    "$MP" --live "allow system_server bpffs:lnk_file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow system_server sysfs_bpf:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow system_server sysfs_bpf:dir { search read open }" 2>/dev/null
+
+    # crash_dump (diagnostics)
+    "$MP" --live "allow crash_dump bpfloader:process { ptrace }" 2>/dev/null
+    "$MP" --live "allow dumpstate bpfloader:process { ptrace }" 2>/dev/null
+
+    # shell/adb
+    "$MP" --live "allow shell proc_net:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow shell proc_net:dir { read search open }" 2>/dev/null
+
+    # Magisk module context
+    "$MP" --live "allow magisk proc_net:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow magisk proc_net:dir { read search open }" 2>/dev/null
+    "$MP" --live "allow magisk binder_device:chr_file { read write open ioctl }" 2>/dev/null
+    "$MP" --live "allow magisk servicemanager:binder { call transfer }" 2>/dev/null
+    "$MP" --live "allow magisk servicemanager:service_manager { find add }" 2>/dev/null
+    "$MP" --live "allow magisk netstats_service:service_manager { add find }" 2>/dev/null
+    "$MP" --live "allow magisk sysfs_bpf:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow magisk sysfs_bpf:dir { search read open }" 2>/dev/null
+
+    # Allow all domains to read /proc/net/dev
+    "$MP" --live "allow domain proc_net:file { read open getattr }" 2>/dev/null
+    "$MP" --live "allow domain proc_net:dir { read search open }" 2>/dev/null
+
     _log "Live SELinux rules applied"
 }
 
@@ -139,8 +208,73 @@ start_nproxy() {
 
 check_nproxy_registered() {
     grep -q "registered '" "$LOG" 2>/dev/null && return 0
-    [ -f /data/local/tmp/netproxy_registered ] && return 0
+    [ -f "$REGFILE" ] && return 0
     return 1
+}
+
+# ============================================================
+# Write netstats files fallback
+# This creates minimal netstats XML that NetworkStatsService
+# can read for interface-level stats when BPF/netproxy fail
+# ============================================================
+write_netstats_fallback() {
+    _log "--- Writing netstats fallback files ---"
+    mkdir -p "$STATSFILE_DIR" 2>/dev/null
+
+    NOW=$(date +%s 2>/dev/null || echo 1700000000)
+    START=$((NOW - 86400))
+
+    # Read current interface stats from /proc/net/dev
+    local total_rx=0 total_tx=0 total_rxp=0 total_txp=0
+    local iface_list=""
+
+    if [ -f /proc/net/dev ]; then
+        while IFS= read -r line; do
+            iface=$(echo "$line" | cut -d: -f1 | tr -d ' ')
+            [ -z "$iface" ] && continue
+            [ "$iface" = "lo" ] && continue
+            case "$iface" in
+                eth*|wlan*|rmnet*|p2p*|tun*|veth*)
+                    ;;
+                *)
+                    # Skip unknown interfaces
+                    continue
+                    ;;
+            esac
+
+            vals=$(echo "$line" | cut -d: -f2)
+            rxbytes=$(echo "$vals" | awk '{print $1}')
+            rxpackets=$(echo "$vals" | awk '{print $2}')
+            txbytes=$(echo "$vals" | awk '{print $9}')
+            txpackets=$(echo "$vals" | awk '{print $10}')
+
+            total_rx=$((total_rx + ${rxbytes:-0}))
+            total_tx=$((total_tx + ${txbytes:-0}))
+            total_rxp=$((total_rxp + ${rxpackets:-0}))
+            total_txp=$((total_txp + ${txpackets:-0}))
+
+            iface_list="$iface_list $iface"
+        done < /proc/net/dev
+    fi
+
+    # Write dev stats XML
+    cat > "$STATSFILE_DIR/netstats_dev.xml" <<DEVXML
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<stats devDetail="true">
+<st if="$iface_list" dev="wlan0" uid="-1" tag="0x0" set="default" rb="$total_rx" rp="$total_rxp" tb="$total_tx" tp="$total_txp" />
+</stats>
+DEVXML
+
+    # Write UID stats XML (empty - no per-UID data available)
+    cat > "$STATSFILE_DIR/netstats_uid.xml" <<UIDXML
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<stats uidStats="true">
+</stats>
+UIDXML
+
+    chmod 0644 "$STATSFILE_DIR/netstats_dev.xml" 2>/dev/null
+    chmod 0644 "$STATSFILE_DIR/netstats_uid.xml" 2>/dev/null
+    _log "Wrote netstats fallback (rx=$total_rx tx=$total_tx)"
 }
 
 _log "=== service.sh started ==="
@@ -215,6 +349,7 @@ elif [ "$BPF_RESTORE" -eq 0 ] || [ "$STUB_BPF" -eq 1 ]; then
 else
     _log "--- Phase 2: BPF Repair ---"
 
+    # Ensure correct kver_override
     CURRENT_OVERRIDE=$(getprop ro.bpf.kver_override 2>/dev/null)
     if [ "$CURRENT_OVERRIDE" != "$CORRECT_KVER" ]; then
         _log "Fixing kver_override: $CURRENT_OVERRIDE -> $CORRECT_KVER"
@@ -225,11 +360,15 @@ else
 
     apply_sepolicy
 
-    [ -d "$BPF_NETD/mainline_done" ] && rm -rf "$BPF_NETD/mainline_done" 2>/dev/null \
-        && _log "Deleted mainline_done"
+    # Remove all mainline_done markers
+    for MARKER in "$BPF_NETD/mainline_done" /dev/pmt/atomic/tebpf_mainline_done; do
+        [ -d "$MARKER" ] && rm -rf "$MARKER" 2>/dev/null \
+            && _log "Deleted marker: $MARKER"
+    done
 
     echo 1 > /proc/sys/net/core/bpf_jit_enable 2>/dev/null
 
+    # Try up to 3 repair attempts
     ATTEMPT=0
     while [ "$ATTEMPT" -lt 3 ] && ! bpf_stats_ready; do
         ATTEMPT=$((ATTEMPT+1))
@@ -272,9 +411,6 @@ fi
 
 # Phase 3: xt_qtaguid fallback
 QTAGUID_OK=0
-STATSFILE_D="/data/local/tmp/netstats"
-mkdir -p "$STATSFILE_D" 2>/dev/null
-
 if [ "$BPF_STATS_OK" -eq 0 ] && [ "$KMAJOR" -lt 5 ]; then
     _log "--- Phase 3: xt_qtaguid fallback ---"
     for MP in \
@@ -353,14 +489,22 @@ if [ -n "$NPROXY_BIN" ]; then
     fi
 
     if [ -n "$NPROXY_PID" ]; then
+        # Exponential backoff wait for registration
         WAIT_REG=0
-        while [ "$WAIT_REG" -lt 15 ]; do
-            sleep 1; WAIT_REG=$((WAIT_REG+1))
+        BACKOFF=2
+        while [ "$WAIT_REG" -lt 30 ]; do
+            sleep $BACKOFF; WAIT_REG=$((WAIT_REG + BACKOFF))
             if check_nproxy_registered; then
                 NPROXY_REGISTERED=1
                 _log "Netproxy registered successfully (after ${WAIT_REG}s)"
                 break
             fi
+            # Increase backoff up to max 5s
+            BACKOFF=$((BACKOFF + 1))
+            [ "$BACKOFF" -gt 5 ] && BACKOFF=5
+
+            # Re-apply sepolicy periodically
+            [ "$((WAIT_REG % 10))" -eq 0 ] && apply_sepolicy 2>/dev/null
         done
         if [ "$NPROXY_REGISTERED" -eq 0 ]; then
             _log "Netproxy NOT registered after ${WAIT_REG}s"
@@ -371,7 +515,14 @@ else
     _log "FATAL: netproxy binary not found"
 fi
 
+# Phase 6b: Write netstats fallback if nothing else works
+if [ "$BPF_STATS_OK" -eq 0 ] && [ "$NPROXY_REGISTERED" -eq 0 ] && [ "$QTAGUID_OK" -eq 0 ]; then
+    _log "--- Phase 6b: Netstats file fallback ---"
+    write_netstats_fallback
+fi
+
 # Phase 7: Restart SystemUI (to pick up our registered service)
+# DON'T restart SystemUI if no stats mechanism is active - it could cause boot loops
 if [ "$NPROXY_REGISTERED" -eq 1 ] || [ "$BPF_STATS_OK" -eq 1 ]; then
     _log "--- Phase 7: Restart SystemUI ---"
     sleep 3
@@ -399,12 +550,12 @@ if [ "$QTAGUID_OK" -eq 1 ]; then
     _log "  xt_qtaguid available: legacy stats active"
 fi
 if [ "$BPF_STATS_OK" -eq 0 ] && [ "$NPROXY_REGISTERED" -eq 0 ] && [ "$QTAGUID_OK" -eq 0 ]; then
-    _log "  No stats mechanism active"
+    _log "  Netstats file fallback: interface-level stats (no per-UID)"
 fi
 _log "============================================"
 _log "=== service.sh complete ==="
 
-# Phase 9: Watchdog
+# Phase 9: Watchdog (safe - no aggressive actions that could cause boot loops)
 WD=0
 while true; do
     sleep 300
@@ -418,49 +569,35 @@ while true; do
     [ "$RNM" = "1" ] && settings put global restricted_networking_mode 0 2>/dev/null \
         && _log "[WD-$WD] Cleared restricted_networking_mode"
 
+    # Only restart netd if it died (not preemptively)
     NETD=$(getprop init.svc.netd 2>/dev/null)
-    [ "$NETD" != "running" ] && setprop ctl.restart netd 2>/dev/null \
-        && _log "[WD-$WD] Restarted netd"
+    [ "$NETD" != "running" ] && [ "$NETD" != "" ] && setprop ctl.restart netd 2>/dev/null \
+        && _log "[WD-$WD] Restarted netd (was: $NETD)"
 
+    # BPF map restoration (gentle - don't restart bpfloader aggressively)
     if [ "$BPF_STATS_OK" -eq 1 ] && ! bpf_stats_ready; then
-        _log "[WD-$WD] BPF maps lost, attempting restore..."
+        _log "[WD-$WD] BPF maps lost, attempting gentle restore..."
         [ -d "$BPF_NETD/mainline_done" ] && rm -rf "$BPF_NETD/mainline_done" 2>/dev/null
-        stop bpfloader 2>/dev/null; sleep 1; start bpfloader 2>/dev/null
+        # Just restart netd, don't restart bpfloader (could cause issues)
+        setprop ctl.restart netd 2>/dev/null
         sleep 10
         if bpf_stats_ready; then
-            _log "[WD-$WD] BPF maps restored"
-            setprop ctl.restart netd 2>/dev/null
+            _log "[WD-$WD] BPF maps restored via netd restart"
+        else
+            _log "[WD-$WD] BPF maps still missing (netd restart insufficient)"
         fi
     fi
 
+    # Netproxy heartbeat
     if [ -n "$NPROXY_BIN" ]; then
         if ! pidof netproxy > /dev/null 2>&1; then
             _log "[WD-$WD] Proxy died, restarting..."
             NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
-            if [ -n "$NPROXY_PID" ]; then
-                WAIT_REG=0
-                while [ "$WAIT_REG" -lt 10 ]; do
-                    sleep 1; WAIT_REG=$((WAIT_REG+1))
-                    if check_nproxy_registered; break; fi
-                done
-                if check_nproxy_registered; then
-                    am force-stop com.android.systemui 2>/dev/null || true
-                fi
-            fi
-        elif ! check_nproxy_registered; then
-            _log "[WD-$WD] Proxy running but not registered, restarting..."
-            killall -9 netproxy 2>/dev/null || true
-            sleep 1
-            NPROXY_PID=$(start_nproxy "$NPROXY_BIN")
         fi
     fi
 
-    if stub_bpfloader_detected; then
-        rm -rf "$BPF_NETD/mainline_done" 2>/dev/null
-        _log "[WD-$WD] Deleted stale mainline_done from stub bpfloader"
-    fi
-
+    # Periodic status
     if [ "$((WD % 12))" -eq 0 ]; then
-        _log "[WD-$WD] maps=$(count_bpf_maps) proxy=$(pidof netproxy 2>/dev/null || echo none) registered=$(check_nproxy_registered && echo yes || echo no) netd=$NETD"
+        _log "[WD-$WD] maps=$(count_bpf_maps) proxy=$(pidof netproxy 2>/dev/null || echo none) registered=$(check_nproxy_registered && echo yes || echo no) netd=$(getprop init.svc.netd 2>/dev/null)"
     fi
 done
