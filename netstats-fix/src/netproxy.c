@@ -53,7 +53,7 @@
 #define STATSFILE_DEV "/data/local/tmp/netproxy_dev"
 #define STATSFILE_UID_FILE "/data/local/tmp/netproxy_uid"
 #define REGFILE "/data/local/tmp/netproxy_registered"
-#define NETPROXY_VERSION "10.0"
+#define NETPROXY_VERSION "10.1"
 #define SESSION_BASE 0x20000
 #define MAX_SESSIONS 64
 #define MAX_IFACES 64
@@ -1681,16 +1681,22 @@ static const struct bpf_map_def g_bpf_map_defs[BPF_MAP_IDX_COUNT] = {
     [BPF_MAP_IDX_UID_COUNTERSET]    = { "map_netd_uid_counterset_map",    BPF_MAP_TYPE_HASH, 4,  4,  8192 },
 };
 
-static int g_bpf_fds[BPF_MAP_IDX_COUNT];
+static int g_bpf_fds[BPF_MAP_IDX_COUNT] = { [0 ... BPF_MAP_IDX_COUNT - 1] = -1 };
 static int g_bpf_created[BPF_MAP_IDX_COUNT];
 static int g_bpf_map_state_logged = 0;
 
 static int ensure_bpffs(void) {
     struct stat st;
+    if (stat("/sys/fs/bpf", &st) != 0) {
+        if (mkdir("/sys/fs/bpf", 0755) != 0 && errno != EEXIST)
+            log_msg("[BPF] mkdir /sys/fs/bpf failed errno=%d", errno);
+    }
     if (stat(BPF_NETD_DIR, &st) != 0) {
-        mkdir(BPF_NETD_DIR, 0700);
-        if (mount("bpf", BPF_NETD_DIR, "bpf", 0, NULL) == 0)
-            log_msg("[BPF] mounted bpffs at %s", BPF_NETD_DIR);
+        if (mkdir(BPF_NETD_DIR, 0700) != 0 && errno != EEXIST) {
+            log_msg("[BPF] mkdir %s failed errno=%d", BPF_NETD_DIR, errno);
+            return -1;
+        }
+        log_msg("[BPF] created dir %s", BPF_NETD_DIR);
     }
     chmod(BPF_NETD_DIR, 0700);
     return (stat(BPF_NETD_DIR, &st) == 0) ? 0 : -1;
@@ -1739,11 +1745,43 @@ static int bpf_delete_elem(int fd, const void* key) {
     return bpf_syscall(BPF_MAP_DELETE_ELEM, &attr);
 }
 
-static int open_or_create_bpf_map(int idx) {
-    if (g_bpf_fds[idx] >= 0) return g_bpf_fds[idx];
+static int bpf_map_get_next_key(int fd, const void* key, void* next_key) {
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd    = (uint32_t)fd;
+    attr.key       = (uint64_t)(uintptr_t)key;
+    attr.next_key  = (uint64_t)(uintptr_t)next_key;
+    return bpf_syscall(BPF_MAP_GET_NEXT_KEY, &attr);
+}
 
+static int bpf_map_has_entries(int fd) {
+    if (fd < 0) return 0;
+    uint64_t k = 0;
+    return bpf_map_get_next_key(fd, NULL, &k) == 0;
+}
+
+/* Only fill a map that we created, or one that is completely empty
+ * (native accounting on this GSI is dead anyway, so an empty map is ours
+ * to seed; a non-empty map is left untouched to avoid corrupting real data). */
+static int should_populate_map(int idx) {
+    int fd = g_bpf_fds[idx];
+    if (fd < 0) return 0;
+    if (g_bpf_created[idx]) return 1;
+    return !bpf_map_has_entries(fd);
+}
+
+static int open_or_create_bpf_map(int idx) {
     char path[256];
     snprintf(path, sizeof(path), "%s/%s", BPF_NETD_DIR, g_bpf_map_defs[idx].basename);
+
+    if (g_bpf_fds[idx] >= 0) {
+        if (access(path, F_OK) == 0)
+            return g_bpf_fds[idx];
+        log_msg("[BPF] %s pin vanished, recreating", g_bpf_map_defs[idx].basename);
+        close(g_bpf_fds[idx]);
+        g_bpf_fds[idx] = -1;
+        g_bpf_created[idx] = 0;
+    }
 
     int fd;
     if (access(path, F_OK) == 0) {
@@ -1833,13 +1871,13 @@ static void populate_bpf_maps(void) {
     struct net_stats total;
     read_all_stats(&total);
 
-    int created_iface = (g_bpf_created[BPF_MAP_IDX_IFACE_STATS] || g_bpf_created[BPF_MAP_IDX_IFACE_INDEX_NAME]);
-    if (created_iface) {
+    int have_iface = (g_bpf_fds[BPF_MAP_IDX_IFACE_STATS] >= 0 || g_bpf_fds[BPF_MAP_IDX_IFACE_INDEX_NAME] >= 0);
+    if (have_iface) {
         for (int i = 0; i < count; i++) {
             int idx = iface_index(ifaces[i].name);
             if (idx <= 0) continue;
 
-            if (g_bpf_created[BPF_MAP_IDX_IFACE_INDEX_NAME]) {
+            if (should_populate_map(BPF_MAP_IDX_IFACE_INDEX_NAME)) {
                 struct bpf_iface_name_value nv;
                 memset(&nv, 0, sizeof(nv));
                 strncpy(nv.name, ifaces[i].name, sizeof(nv.name) - 1);
@@ -1848,7 +1886,7 @@ static void populate_bpf_maps(void) {
                     log_msg("[BPF] iface_index_name %s(%d) failed: errno=%d", ifaces[i].name, idx, errno);
             }
 
-            if (g_bpf_created[BPF_MAP_IDX_IFACE_STATS]) {
+            if (should_populate_map(BPF_MAP_IDX_IFACE_STATS)) {
                 struct bpf_stats_value v;
                 struct net_stats n;
                 memset(&n, 0, sizeof(n));
@@ -1898,8 +1936,8 @@ static void populate_bpf_maps(void) {
         closedir(proc);
     }
 
-    int created_uid = (g_bpf_created[BPF_MAP_IDX_APP_UID_STATS] || g_bpf_created[BPF_MAP_IDX_STATS_A]);
-    if (!created_uid || uidc == 0) return;
+    int have_uid = (g_bpf_fds[BPF_MAP_IDX_APP_UID_STATS] >= 0 || g_bpf_fds[BPF_MAP_IDX_STATS_A] >= 0);
+    if (!have_uid || uidc == 0) return;
 
     uint64_t per_uid_rx = total.rxBytes / (uint64_t)uidc;
     uint64_t per_uid_tx = total.txBytes / (uint64_t)uidc;
@@ -1915,12 +1953,12 @@ static void populate_bpf_maps(void) {
     for (int i = 0; i < uidc; i++) {
         uint32_t uid = (uint32_t)uids[i];
 
-        if (g_bpf_created[BPF_MAP_IDX_APP_UID_STATS]) {
+        if (should_populate_map(BPF_MAP_IDX_APP_UID_STATS)) {
             if (bpf_update_elem(g_bpf_fds[BPF_MAP_IDX_APP_UID_STATS], &uid, &v) != 0)
                 log_msg("[BPF] app_uid_stats uid=%u failed: errno=%d", uid, errno);
         }
 
-        if (g_bpf_created[BPF_MAP_IDX_STATS_A]) {
+        if (should_populate_map(BPF_MAP_IDX_STATS_A)) {
             struct bpf_stats_key k;
             memset(&k, 0, sizeof(k));
             k.uid = (int32_t)uid;
@@ -1934,7 +1972,7 @@ static void populate_bpf_maps(void) {
         /* stats_map_B intentionally left empty: the reader sums A+B,
          * writing both would double-count. */
 
-        if (g_bpf_created[BPF_MAP_IDX_UID_OWNER]) {
+        if (should_populate_map(BPF_MAP_IDX_UID_OWNER)) {
             struct bpf_owner_value ov;
             memset(&ov, 0, sizeof(ov));
             ov.iif = 0;
@@ -2350,12 +2388,23 @@ int main(int argc, char* argv[]) {
         int r = open_all_bpf_maps();
         if (r == 0) {
             populate_bpf_maps();
-            log_msg("netproxy --maps done: %d maps available", BPF_MAP_IDX_COUNT);
+            int missing = 0;
+            for (int i = 0; i < BPF_MAP_IDX_COUNT; i++) {
+                char path[256];
+                snprintf(path, sizeof(path), "%s/%s", BPF_NETD_DIR, g_bpf_map_defs[i].basename);
+                int ok = (access(path, F_OK) == 0);
+                if (!ok) missing++;
+                log_msg("[BPF] verify %s: %s", g_bpf_map_defs[i].basename,
+                        ok ? "present" : "MISSING");
+            }
+            log_msg("netproxy --maps done: %d/%d maps present", BPF_MAP_IDX_COUNT - missing,
+                    BPF_MAP_IDX_COUNT);
+            return missing == 0 ? 0 : 2;
         } else {
             log_msg("netproxy --maps FAILED to create BPF maps (errno=%d %s)",
                     errno, strerror(errno));
+            return 3;
         }
-        return 0;
     }
 
     log_msg("==============================================");

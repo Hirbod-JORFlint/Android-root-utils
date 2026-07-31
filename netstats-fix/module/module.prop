@@ -1,6 +1,6 @@
 id=netstats-fix
 name=Network Stats Fix for GSI
-version=v16
-versionCode=16
+version=v17
+versionCode=17
 author=Hirbod-JORFlint
-description=Universal fix for broken traffic indicator on Android GSIs. Creates+pins the netd BPF maps with the exact layouts libnetworkstats.so expects and keeps them populated from /proc/net/dev, so TrafficStats/NetworkStatsManager report real traffic even when the GSI's bpfloader is a stub. Falls back to BPF restoration, /proc/uid_stat/, xt_qtaguid and netstats files. Native binder proxy v10.0. Handles system/system_axion/system_infinity variants. No SystemUI patching.
+description=Universal fix for broken traffic indicator on Android GSIs. Creates+pins the netd BPF maps with the exact layouts libnetworkstats.so expects and keeps them populated from /proc/net/dev, so TrafficStats/NetworkStatsManager report real traffic even when the GSI's bpfloader is a stub. Falls back to BPF restoration, /proc/uid_stat/, xt_qtaguid and netstats files. Native binder proxy v10.1. Handles system/system_axion/system_infinity variants. No SystemUI patching.
