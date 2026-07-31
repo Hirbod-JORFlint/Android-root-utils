@@ -1,0 +1,6 @@
+id=netstats-fix
+name=Network Stats Fix for GSI
+version=v15
+versionCode=15
+author=Hirbod-JORFlint
+description=Universal fix for broken traffic indicator on Android GSIs. BPF restoration + per-UID stats population in BPF maps + /proc/uid_stat/ fallback + xt_qtaguid loading. Native binder proxy v10.0 with dynamic interfaces, per-UID stat distribution, watchdog. Handles system/system_axion/system_infinity variants.

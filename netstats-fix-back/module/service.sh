@@ -17,16 +17,14 @@ REGFILE="/data/local/tmp/netproxy_registered"
 count_bpf_maps() {
     local c=0
     for m in "$BPF_MAP_OWNER" "$BPF_MAP_STATS" "$BPF_MAP_COOKIE" \
-             "$BPF_MAP_CONFIG" "$BPF_MAP_STATS_A" "$BPF_MAP_STATS_B" \
-             "$BPF_NETD/map_netd_iface_stats_map" \
-             "$BPF_NETD/map_netd_iface_index_name_map"; do
+             "$BPF_MAP_CONFIG" "$BPF_MAP_STATS_A" "$BPF_MAP_STATS_B"; do
         [ -e "$m" ] && c=$((c+1))
     done
     echo "$c"
 }
 
 bpf_stats_ready() {
-    [ -e "$BPF_MAP_STATS" ] && [ -e "$BPF_NETD/map_netd_iface_stats_map" ]
+    [ -e "$BPF_MAP_STATS" ] && [ -e "$BPF_MAP_CONFIG" ]
 }
 
 stub_bpfloader_detected() {
@@ -320,7 +318,7 @@ done
 
 MAP_COUNT=$(count_bpf_maps)
 _log "BPF maps present: $MAP_COUNT"
-for m in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B iface_stats_map iface_index_name_map; do
+for m in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B; do
     p="$BPF_NETD/map_netd_$m"
     [ -e "$p" ] && _log "  $m: present" || _log "  $m: absent"
 done
@@ -563,20 +561,9 @@ else
     _log "FATAL: netproxy binary not found"
 fi
 
-# Phase 6b: Re-check - netproxy may have created+pinned the BPF maps
-# while we were waiting. If so, treat stats as live.
-if [ "$BPF_STATS_OK" -eq 0 ]; then
-    if bpf_stats_ready; then
-        BPF_STATS_OK=1
-        _log "BPF maps now present (created by netproxy) - marking stats as live"
-    else
-        _log "BPF maps still absent after netproxy start"
-    fi
-fi
-
-# Phase 6c: Write netstats fallback if nothing else works
+# Phase 6b: Write netstats fallback if nothing else works
 if [ "$BPF_STATS_OK" -eq 0 ] && [ "$NPROXY_REGISTERED" -eq 0 ] && [ "$QTAGUID_OK" -eq 0 ]; then
-    _log "--- Phase 6c: Netstats file fallback ---"
+    _log "--- Phase 6b: Netstats file fallback ---"
     write_netstats_fallback
 fi
 

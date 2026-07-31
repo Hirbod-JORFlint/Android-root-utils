@@ -45,7 +45,6 @@
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include <net/if.h>
 #include <arpa/inet.h>
 
 #define LOGFILE "/data/local/tmp/netproxy.log"
@@ -1587,244 +1586,158 @@ static void handle_transaction(const struct binder_transaction_data* tr) {
     write_all_stats_sources();
 }
 
+/* (removed - replaced by improved populate_uid_stat_all() above) */
+
 /* ============================================================
- * BPF map manager.
- *
- * libnetworkstats.so (JNI behind NetworkStatsService) reads
- * per-UID / per-interface stats straight from the pinned BPF
- * maps under /sys/fs/bpf/netd_shared/.  When the GSI's
- * bpfloader is a stub (typical for PHH-patched GSIs) those
- * maps never exist, so every native lookup returns null and the
- * traffic indicator reads 0.
- *
- * We fix it by CREATING + PINNING the maps ourselves with the
- * exact layouts the native code expects (verified against the
- * BTF of netd.o shipped in the tethering APEX):
- *
- *   map_netd_app_uid_stats_map      HASH  key 4  (uid)        val 32 Stats
- *   map_netd_stats_map_A            HASH  key 16 (uid/tag/..) val 32 Stats
- *   map_netd_stats_map_B            HASH  key 16              val 32 Stats
- *   map_netd_iface_stats_map        HASH  key 4  (ifindex)    val 32 Stats
- *   map_netd_iface_index_name_map   HASH  key 4  (ifindex)    val 16 name
- *   map_netd_configuration_map      HASH  key 4               val 4
- *   map_netd_uid_owner_map          HASH  key 4               val 8
- *   map_netd_cookie_tag_map         HASH  key 8               val 8
- *   map_netd_uid_counterset_map     HASH  key 4               val 4
- *
- * Stats value layout (packets BEFORE bytes - matches BTF):
- *   { uint64 rxPackets; uint64 rxBytes; uint64 txPackets; uint64 txBytes; }
- *
- * Only maps that WE created (i.e. that did not exist before) are
- * populated with estimates from /proc/net/dev - maps that were
- * already present are left untouched so real eBPF accounting
- * keeps working on devices where bpfloader is functional.
+ * BPF map writer - populate app_uid_stats_map so TrafficStats
+ * can read per-UID data from the kernel BPF maps directly.
+ * Uses bpf() syscall with pinned map fd from /sys/fs/bpf/
  * ============================================================ */
 static int bpf_syscall(enum bpf_cmd cmd, union bpf_attr *attr) {
     return (int)syscall(__NR_bpf, cmd, attr, sizeof(*attr));
 }
 
-#define BPF_NETD_DIR "/sys/fs/bpf/netd_shared"
+static int open_bpf_map(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        fd = open(path, O_RDONLY);
+    }
+    return fd;
+}
 
-struct bpf_stats_value {           /* Stats from netd.o BTF: packets first */
-    uint64_t rxPackets;
-    uint64_t rxBytes;
-    uint64_t txPackets;
-    uint64_t txBytes;
-} __attribute__((packed));
+#define BPF_APP_UID_STATS_MAP_PATH "/sys/fs/bpf/netd_shared/map_netd_app_uid_stats_map"
+#define BPF_UID_OWNER_MAP_PATH    "/sys/fs/bpf/netd_shared/map_netd_uid_owner_map"
+#define BPF_COOKIE_TAG_MAP_PATH   "/sys/fs/bpf/netd_shared/map_netd_cookie_tag_map"
 
-struct bpf_stats_key {             /* StatsKey from netd.o BTF */
-    int32_t  uid;
+struct bpf_stats_key {
+    uint32_t uid;
     uint32_t tag;
     uint32_t counter_set;
-    int32_t  iface_index;
+    uint32_t pad;
 } __attribute__((packed));
 
-struct bpf_owner_value {           /* uid_owner_map value */
-    int32_t  iif;
-    int32_t  rule;
+struct bpf_stats_value {
+    uint64_t rxBytes;
+    uint64_t rxPackets;
+    uint64_t txBytes;
+    uint64_t txPackets;
+    uint64_t timestamp;
 } __attribute__((packed));
 
-struct bpf_iface_name_value {
-    char name[16];
+struct bpf_owner_key {
+    uint32_t uid;
+    uint32_t pad;
 } __attribute__((packed));
 
-enum {
-    BPF_MAP_IDX_APP_UID_STATS = 0,
-    BPF_MAP_IDX_STATS_A,
-    BPF_MAP_IDX_STATS_B,
-    BPF_MAP_IDX_IFACE_STATS,
-    BPF_MAP_IDX_IFACE_INDEX_NAME,
-    BPF_MAP_IDX_CONFIGURATION,
-    BPF_MAP_IDX_UID_OWNER,
-    BPF_MAP_IDX_COOKIE_TAG,
-    BPF_MAP_IDX_UID_COUNTERSET,
-    BPF_MAP_IDX_COUNT
-};
+struct bpf_owner_value {
+    uint64_t owner;
+} __attribute__((packed));
 
-struct bpf_map_def {
-    const char* basename;      /* map_netd_... */
-    uint32_t    type;          /* BPF_MAP_TYPE_HASH */
-    uint32_t    key_size;
-    uint32_t    value_size;
-    uint32_t    max_entries;
-};
+static int g_bpf_stats_map_fd = -1;
+static int g_bpf_owner_map_fd = -1;
 
-static const struct bpf_map_def g_bpf_map_defs[BPF_MAP_IDX_COUNT] = {
-    [BPF_MAP_IDX_APP_UID_STATS]     = { "map_netd_app_uid_stats_map",     BPF_MAP_TYPE_HASH, 4,  sizeof(struct bpf_stats_value), 16384 },
-    [BPF_MAP_IDX_STATS_A]           = { "map_netd_stats_map_A",           BPF_MAP_TYPE_HASH, 16, sizeof(struct bpf_stats_value), 65536 },
-    [BPF_MAP_IDX_STATS_B]           = { "map_netd_stats_map_B",           BPF_MAP_TYPE_HASH, 16, sizeof(struct bpf_stats_value), 65536 },
-    [BPF_MAP_IDX_IFACE_STATS]       = { "map_netd_iface_stats_map",       BPF_MAP_TYPE_HASH, 4,  sizeof(struct bpf_stats_value), 512 },
-    [BPF_MAP_IDX_IFACE_INDEX_NAME]  = { "map_netd_iface_index_name_map",  BPF_MAP_TYPE_HASH, 4,  16, 512 },
-    [BPF_MAP_IDX_CONFIGURATION]     = { "map_netd_configuration_map",     BPF_MAP_TYPE_HASH, 4,  4,  32 },
-    [BPF_MAP_IDX_UID_OWNER]         = { "map_netd_uid_owner_map",         BPF_MAP_TYPE_HASH, 4,  sizeof(struct bpf_owner_value), 8192 },
-    [BPF_MAP_IDX_COOKIE_TAG]        = { "map_netd_cookie_tag_map",        BPF_MAP_TYPE_HASH, 8,  8,  32768 },
-    [BPF_MAP_IDX_UID_COUNTERSET]    = { "map_netd_uid_counterset_map",    BPF_MAP_TYPE_HASH, 4,  4,  8192 },
-};
-
-static int g_bpf_fds[BPF_MAP_IDX_COUNT];
-static int g_bpf_created[BPF_MAP_IDX_COUNT];
-static int g_bpf_map_state_logged = 0;
-
-static int ensure_bpffs(void) {
-    struct stat st;
-    if (stat(BPF_NETD_DIR, &st) != 0) {
-        mkdir(BPF_NETD_DIR, 0700);
-        if (mount("bpf", BPF_NETD_DIR, "bpf", 0, NULL) == 0)
-            log_msg("[BPF] mounted bpffs at %s", BPF_NETD_DIR);
+static void open_bpf_maps(void) {
+    if (g_bpf_stats_map_fd < 0) {
+        g_bpf_stats_map_fd = open_bpf_map(BPF_APP_UID_STATS_MAP_PATH);
+        if (g_bpf_stats_map_fd >= 0)
+            log_msg("[BPF] Opened app_uid_stats_map fd=%d", g_bpf_stats_map_fd);
+        else
+            log_msg("[BPF] Cannot open app_uid_stats_map (errno=%d) - will use uid_stat fallback", errno);
     }
-    chmod(BPF_NETD_DIR, 0700);
-    return (stat(BPF_NETD_DIR, &st) == 0) ? 0 : -1;
+    if (g_bpf_owner_map_fd < 0) {
+        g_bpf_owner_map_fd = open_bpf_map(BPF_UID_OWNER_MAP_PATH);
+        if (g_bpf_owner_map_fd >= 0)
+            log_msg("[BPF] Opened uid_owner_map fd=%d", g_bpf_owner_map_fd);
+    }
 }
 
-static int bpf_create_map(const struct bpf_map_def* def) {
-    union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.map_type    = def->type;
-    attr.key_size    = def->key_size;
-    attr.value_size  = def->value_size;
-    attr.max_entries = def->max_entries;
-    return bpf_syscall(BPF_MAP_CREATE, &attr);
-}
+static int write_bpf_stats(int uid, uint64_t rxBytes, uint64_t rxPackets,
+                           uint64_t txBytes, uint64_t txPackets) {
+    if (g_bpf_stats_map_fd < 0) return -1;
 
-static int bpf_obj_get(const char* path) {
+    struct bpf_stats_key key;
+    struct bpf_stats_value val;
     union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.pathname = (uint64_t)(uintptr_t)path;
-    return bpf_syscall(BPF_OBJ_GET, &attr);
-}
 
-static int bpf_obj_pin(int fd, const char* path) {
-    union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.pathname = (uint64_t)(uintptr_t)path;
-    attr.bpf_fd   = (uint32_t)fd;
-    return bpf_syscall(BPF_OBJ_PIN, &attr);
-}
+    memset(&key, 0, sizeof(key));
+    key.uid = (uint32_t)uid;
+    key.tag = 0;
+    key.counter_set = 0; /* default counter set */
 
-static int bpf_update_elem(int fd, const void* key, const void* value) {
-    union bpf_attr attr;
+    memset(&val, 0, sizeof(val));
+    val.rxBytes   = rxBytes;
+    val.rxPackets = rxPackets;
+    val.txBytes   = txBytes;
+    val.txPackets = txPackets;
+    val.timestamp = (uint64_t)time(NULL);
+
     memset(&attr, 0, sizeof(attr));
-    attr.map_fd = (uint32_t)fd;
-    attr.key    = (uint64_t)(uintptr_t)key;
-    attr.value  = (uint64_t)(uintptr_t)value;
+    attr.map_fd = (uint32_t)g_bpf_stats_map_fd;
+    attr.key    = (uint64_t)(uintptr_t)&key;
+    attr.value  = (uint64_t)(uintptr_t)&val;
     attr.flags  = BPF_ANY;
-    return bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr);
-}
 
-static int bpf_delete_elem(int fd, const void* key) {
-    union bpf_attr attr;
+    int ret = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr);
+    if (ret < 0 && errno != EEXIST) {
+        log_msg("[BPF] MAP_UPDATE_ELEM uid=%d failed: errno=%d (%s)",
+                uid, errno, strerror(errno));
+        return ret;
+    }
+
+    /* Also write TX entry (counter_set=1 might be TX) */
+    key.counter_set = 1;
+    memset(&val, 0, sizeof(val));
+    val.txBytes   = txBytes;
+    val.txPackets = txPackets;
+    val.rxBytes   = rxBytes;
+    val.rxPackets = rxPackets;
+    val.timestamp = (uint64_t)time(NULL);
+
     memset(&attr, 0, sizeof(attr));
-    attr.map_fd = (uint32_t)fd;
-    attr.key    = (uint64_t)(uintptr_t)key;
-    return bpf_syscall(BPF_MAP_DELETE_ELEM, &attr);
+    attr.map_fd = (uint32_t)g_bpf_stats_map_fd;
+    attr.key    = (uint64_t)(uintptr_t)&key;
+    attr.value  = (uint64_t)(uintptr_t)&val;
+    attr.flags  = BPF_ANY;
+
+    ret = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr);
+    if (ret < 0 && errno != EEXIST) {
+        log_msg("[BPF] MAP_UPDATE_ELEM uid=%d tx failed: errno=%d", uid, errno);
+    }
+
+    log_msg("[BPF] wrote stats uid=%d rx=%" PRIu64 " tx=%" PRIu64 " (fd=%d)",
+            uid, rxBytes, txBytes, g_bpf_stats_map_fd);
+    return 0;
 }
 
-static int open_or_create_bpf_map(int idx) {
-    if (g_bpf_fds[idx] >= 0) return g_bpf_fds[idx];
+static int write_bpf_owner(int uid) {
+    if (g_bpf_owner_map_fd < 0) return -1;
 
-    char path[256];
-    snprintf(path, sizeof(path), "%s/%s", BPF_NETD_DIR, g_bpf_map_defs[idx].basename);
+    struct bpf_owner_key key;
+    struct bpf_owner_value val;
+    union bpf_attr attr;
 
-    int fd;
-    if (access(path, F_OK) == 0) {
-        fd = bpf_obj_get(path);
-        if (fd >= 0) {
-            g_bpf_fds[idx] = fd;
-            g_bpf_created[idx] = 0;
-            if (!g_bpf_map_state_logged)
-                log_msg("[BPF] existing %s (fd=%d) - native accounting, NOT faking", g_bpf_map_defs[idx].basename, fd);
-            return fd;
-        }
-        log_msg("[BPF] obj_get %s failed (errno=%d) - recreating", g_bpf_map_defs[idx].basename, errno);
+    memset(&key, 0, sizeof(key));
+    key.uid = (uint32_t)uid;
+
+    memset(&val, 0, sizeof(val));
+    val.owner = 1;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)g_bpf_owner_map_fd;
+    attr.key    = (uint64_t)(uintptr_t)&key;
+    attr.value  = (uint64_t)(uintptr_t)&val;
+    attr.flags  = BPF_ANY;
+
+    int ret = bpf_syscall(BPF_MAP_UPDATE_ELEM, &attr);
+    if (ret < 0 && errno != EEXIST) {
+        log_msg("[BPF] OWNER uid=%d failed: errno=%d", uid, errno);
     }
-
-    fd = bpf_create_map(&g_bpf_map_defs[idx]);
-    if (fd < 0) {
-        log_msg("[BPF] MAP_CREATE %s failed: errno=%d (%s)",
-                g_bpf_map_defs[idx].basename, errno, strerror(errno));
-        return -1;
-    }
-
-    if (bpf_obj_pin(fd, path) == 0) {
-        g_bpf_fds[idx] = fd;
-        g_bpf_created[idx] = 1;
-        log_msg("[BPF] created+pinned %s (fd=%d key=%u val=%u max=%u)",
-                g_bpf_map_defs[idx].basename, fd,
-                g_bpf_map_defs[idx].key_size, g_bpf_map_defs[idx].value_size,
-                g_bpf_map_defs[idx].max_entries);
-        return fd;
-    }
-
-    int perr = errno;
-    log_msg("[BPF] PIN %s failed: errno=%d (%s)", g_bpf_map_defs[idx].basename, perr, strerror(perr));
-    close(fd);
-    if (perr == EEXIST) {
-        fd = bpf_obj_get(path);
-        if (fd >= 0) {
-            g_bpf_fds[idx] = fd;
-            g_bpf_created[idx] = 0;
-            log_msg("[BPF] recovered %s (fd=%d)", g_bpf_map_defs[idx].basename, fd);
-            return fd;
-        }
-    }
-    return -1;
-}
-
-static int open_all_bpf_maps(void) {
-    if (ensure_bpffs() != 0) return -1;
-    int ok = 0;
-    for (int i = 0; i < BPF_MAP_IDX_COUNT; i++) {
-        if (open_or_create_bpf_map(i) >= 0) ok++;
-    }
-    if (ok != BPF_MAP_IDX_COUNT && !g_bpf_map_state_logged) {
-        log_msg("[BPF] created/opened %d/%d maps (some may be native-locked)",
-                ok, BPF_MAP_IDX_COUNT);
-    }
-    g_bpf_map_state_logged = 1;
-    return (g_bpf_fds[BPF_MAP_IDX_APP_UID_STATS] >= 0) ? 0 : -1;
-}
-
-static int iface_index(const char* ifname) {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    if (s < 0) return 0;
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
-    ifr.ifr_name[sizeof(ifr.ifr_name) - 1] = '\0';
-    int r = ioctl(s, SIOCGIFINDEX, &ifr);
-    close(s);
-    return (r == 0) ? ifr.ifr_ifindex : 0;
-}
-
-static void bpf_fill_stats_value(struct bpf_stats_value* v, const struct net_stats* n) {
-    v->rxPackets = n->rxPackets;
-    v->rxBytes   = n->rxBytes;
-    v->txPackets = n->txPackets;
-    v->txBytes   = n->txBytes;
+    return ret;
 }
 
 static void populate_bpf_maps(void) {
-    if (open_all_bpf_maps() != 0) return;
+    open_bpf_maps();
+    if (g_bpf_stats_map_fd < 0) return;
 
     struct iface_stat ifaces[MAX_IFACES];
     int count = 0;
@@ -1833,42 +1746,19 @@ static void populate_bpf_maps(void) {
     struct net_stats total;
     read_all_stats(&total);
 
-    int created_iface = (g_bpf_created[BPF_MAP_IDX_IFACE_STATS] || g_bpf_created[BPF_MAP_IDX_IFACE_INDEX_NAME]);
-    if (created_iface) {
-        for (int i = 0; i < count; i++) {
-            int idx = iface_index(ifaces[i].name);
-            if (idx <= 0) continue;
+    /* Write total stats for UID_ALL (-1) */
+    write_bpf_stats(-1, total.rxBytes, total.rxPackets, total.txBytes, total.txPackets);
 
-            if (g_bpf_created[BPF_MAP_IDX_IFACE_INDEX_NAME]) {
-                struct bpf_iface_name_value nv;
-                memset(&nv, 0, sizeof(nv));
-                strncpy(nv.name, ifaces[i].name, sizeof(nv.name) - 1);
-                int ret = bpf_update_elem(g_bpf_fds[BPF_MAP_IDX_IFACE_INDEX_NAME], &idx, &nv);
-                if (ret != 0)
-                    log_msg("[BPF] iface_index_name %s(%d) failed: errno=%d", ifaces[i].name, idx, errno);
-            }
-
-            if (g_bpf_created[BPF_MAP_IDX_IFACE_STATS]) {
-                struct bpf_stats_value v;
-                struct net_stats n;
-                memset(&n, 0, sizeof(n));
-                n.rxBytes = ifaces[i].rxBytes;   n.rxPackets = ifaces[i].rxPackets;
-                n.txBytes = ifaces[i].txBytes;   n.txPackets = ifaces[i].txPackets;
-                bpf_fill_stats_value(&v, &n);
-                if (bpf_update_elem(g_bpf_fds[BPF_MAP_IDX_IFACE_STATS], &idx, &v) != 0)
-                    log_msg("[BPF] iface_stats %s(%d) failed: errno=%d", ifaces[i].name, idx, errno);
-            }
-        }
-    }
-
-    /* Collect UIDs: system UIDs + running app UIDs from /proc */
+    /* Collect active UIDs */
     int uids[256];
     int uidc = 0;
     int base_uids[] = {1000, 1001, 10027, 1013, 1021, 1023, 1027, 1028, 1029, 1037,
                        1038, 1039, 1041, 1044, 1045, 1046, 1047, 2000, 2001, 9999};
-    for (int i = 0; i < (int)(sizeof(base_uids)/sizeof(base_uids[0])) && uidc < 250; i++)
+    for (int i = 0; i < (int)(sizeof(base_uids)/sizeof(base_uids[0])) && uidc < 250; i++) {
         uids[uidc++] = base_uids[i];
+    }
 
+    /* Scan /proc for app UIDs */
     DIR* proc = opendir("/proc");
     if (proc) {
         struct dirent* entry;
@@ -1886,8 +1776,9 @@ static void populate_bpf_maps(void) {
                     sscanf(sl, "Uid:\t%d", &ruid);
                     if (ruid >= 10000) {
                         int dup = 0;
-                        for (int j = 0; j < uidc; j++)
+                        for (int j = 0; j < uidc; j++) {
                             if (uids[j] == ruid) { dup = 1; break; }
+                        }
                         if (!dup) uids[uidc++] = ruid;
                     }
                     break;
@@ -1898,60 +1789,17 @@ static void populate_bpf_maps(void) {
         closedir(proc);
     }
 
-    int created_uid = (g_bpf_created[BPF_MAP_IDX_APP_UID_STATS] || g_bpf_created[BPF_MAP_IDX_STATS_A]);
-    if (!created_uid || uidc == 0) return;
-
-    uint64_t per_uid_rx = total.rxBytes / (uint64_t)uidc;
-    uint64_t per_uid_tx = total.txBytes / (uint64_t)uidc;
-    uint64_t per_uid_rxp = total.rxPackets / (uint64_t)uidc;
-    uint64_t per_uid_txp = total.txPackets / (uint64_t)uidc;
-
-    struct bpf_stats_value v;
-    struct net_stats n;
-    n.rxBytes = per_uid_rx; n.rxPackets = per_uid_rxp;
-    n.txBytes = per_uid_tx; n.txPackets = per_uid_txp;
-    bpf_fill_stats_value(&v, &n);
+    uint64_t per_uid_rx = total.rxBytes / (uint64_t)(uidc > 0 ? uidc : 1);
+    uint64_t per_uid_tx = total.txBytes / (uint64_t)(uidc > 0 ? uidc : 1);
 
     for (int i = 0; i < uidc; i++) {
-        uint32_t uid = (uint32_t)uids[i];
-
-        if (g_bpf_created[BPF_MAP_IDX_APP_UID_STATS]) {
-            if (bpf_update_elem(g_bpf_fds[BPF_MAP_IDX_APP_UID_STATS], &uid, &v) != 0)
-                log_msg("[BPF] app_uid_stats uid=%u failed: errno=%d", uid, errno);
-        }
-
-        if (g_bpf_created[BPF_MAP_IDX_STATS_A]) {
-            struct bpf_stats_key k;
-            memset(&k, 0, sizeof(k));
-            k.uid = (int32_t)uid;
-            k.tag = 0;
-            k.counter_set = 0;
-            k.iface_index = 0;
-            if (bpf_update_elem(g_bpf_fds[BPF_MAP_IDX_STATS_A], &k, &v) != 0)
-                log_msg("[BPF] stats_map_A uid=%u failed: errno=%d", uid, errno);
-        }
-
-        /* stats_map_B intentionally left empty: the reader sums A+B,
-         * writing both would double-count. */
-
-        if (g_bpf_created[BPF_MAP_IDX_UID_OWNER]) {
-            struct bpf_owner_value ov;
-            memset(&ov, 0, sizeof(ov));
-            ov.iif = 0;
-            ov.rule = 1;
-            if (bpf_update_elem(g_bpf_fds[BPF_MAP_IDX_UID_OWNER], &uid, &ov) != 0 &&
-                errno != EEXIST)
-                log_msg("[BPF] uid_owner uid=%u failed: errno=%d", uid, errno);
-        }
+        write_bpf_owner(uids[i]);
+        write_bpf_stats(uids[i], per_uid_rx, per_uid_rx / 1500,
+                        per_uid_tx, per_uid_tx / 1500);
     }
 
-    static time_t last_log = 0;
-    time_t now = time(NULL);
-    if (now - last_log >= 60) {
-        log_msg("[BPF] fake stats: %d UIDs rx=%" PRIu64 " tx=%" PRIu64 " (per-uid rx=%" PRIu64 " tx=%" PRIu64 ")",
-                uidc, total.rxBytes, total.txBytes, per_uid_rx, per_uid_tx);
-        last_log = now;
-    }
+    log_msg("[BPF] Wrote stats for %d UIDs (rx=%" PRIu64 " tx=%" PRIu64 " per_uid)",
+            uidc, per_uid_rx, per_uid_tx);
 }
 
 /* ============================================================
@@ -2339,25 +2187,8 @@ static void write_netstats_xml(void) {
 /* ============================================================
  * main
  * ============================================================ */
-int main(int argc, char* argv[]) {
+int main(void) {
     g_start_time = time(NULL);
-
-    /* Special mode: create + pin + prime the netd BPF maps once, then exit.
-     * Used from post-fs-data.sh so the maps exist before system_server
-     * (and therefore libnetworkstats.so) starts. */
-    if (argc > 1 && strcmp(argv[1], "--maps") == 0) {
-        log_msg("netproxy --maps mode: creating netd BPF maps");
-        int r = open_all_bpf_maps();
-        if (r == 0) {
-            populate_bpf_maps();
-            log_msg("netproxy --maps done: %d maps available", BPF_MAP_IDX_COUNT);
-        } else {
-            log_msg("netproxy --maps FAILED to create BPF maps (errno=%d %s)",
-                    errno, strerror(errno));
-        }
-        return 0;
-    }
-
     log_msg("==============================================");
     log_msg("  Native netproxy v%s starting", NETPROXY_VERSION);
     log_msg("==============================================");

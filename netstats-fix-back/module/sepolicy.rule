@@ -117,65 +117,6 @@ allow magisk sysfs_bpf:file { read open getattr };
 allow magisk sysfs_bpf:dir { read search open };
 allow magisk netstats_service:service_manager { add find };
 
-# === BPF map create/pin/write (netproxy --maps / populate) ===
-# netproxy creates + pins netd HASH maps under /sys/fs/bpf/netd_shared
-# and keeps them populated from /proc/net/dev.
-allow magisk bpf:map_create;
-allow magisk bpf:map_pin;
-allow magisk bpf:map_read;
-allow magisk bpf:map_write;
-allow magisk self:capability { sys_admin net_admin };
-allow magisk self:capability2 { bpf sys_admin net_admin };
-allow magisk bpffs:file { create read write open map getattr setattr unlink };
-allow magisk bpffs:dir { create read write open add_name remove_name search setattr rmdir };
-allow magisk bpffs:lnk_file { read open getattr };
-allow magisk bpffs:chr_file { read write open };
-
-allow su bpf:map_create;
-allow su bpf:map_pin;
-allow su bpf:map_read;
-allow su bpf:map_write;
-allow su self:capability { sys_admin net_admin };
-allow su self:capability2 { bpf sys_admin net_admin };
-allow su bpffs:file { create read write open map getattr setattr unlink };
-allow su bpffs:dir { create read write open add_name remove_name search setattr rmdir };
-
-allow ksud bpf:map_create;
-allow ksud bpf:map_pin;
-allow ksud bpf:map_read;
-allow ksud bpf:map_write;
-allow ksud self:capability { sys_admin net_admin };
-allow ksud self:capability2 { bpf sys_admin net_admin };
-allow ksud bpffs:file { create read write open map getattr setattr unlink };
-allow ksud bpffs:dir { create read write open add_name remove_name search setattr rmdir };
-
-allow mgsk bpf:map_create;
-allow mgsk bpf:map_pin;
-allow mgsk bpf:map_read;
-allow mgsk bpf:map_write;
-allow mgsk self:capability { sys_admin net_admin };
-allow mgsk self:capability2 { bpf sys_admin net_admin };
-allow mgsk bpffs:file { create read write open map getattr setattr unlink };
-allow mgsk bpffs:dir { create read write open add_name remove_name search setattr rmdir };
-
-allow apd bpf:map_create;
-allow apd bpf:map_pin;
-allow apd bpf:map_read;
-allow apd bpf:map_write;
-allow apd self:capability { sys_admin net_admin };
-allow apd self:capability2 { bpf sys_admin net_admin };
-allow apd bpffs:file { create read write open map getattr setattr unlink };
-allow apd bpffs:dir { create read write open add_name remove_name search setattr rmdir };
-
-allow shell bpf:map_create;
-allow shell bpf:map_pin;
-allow shell bpf:map_read;
-allow shell bpf:map_write;
-allow shell self:capability { sys_admin net_admin };
-allow shell self:capability2 { bpf sys_admin net_admin };
-allow shell bpffs:file { create read write open map getattr setattr unlink };
-allow shell bpffs:dir { create read write open add_name remove_name search setattr rmdir };
-
 # === crash_dump / dumpstate (for diagnostics) ===
 allow crash_dump bpfloader:process { ptrace };
 allow dumpstate bpfloader:process { ptrace };

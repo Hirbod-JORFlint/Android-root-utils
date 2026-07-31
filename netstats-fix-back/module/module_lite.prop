@@ -1,0 +1,6 @@
+id=netstats-fix-lite
+name=Network Stats Fix (Proxy + uid_stat - Lite)
+version=v15-lite
+versionCode=15
+author=Hirbod-JORFlint
+description=Lightweight fix for broken traffic indicator. Hides BPF maps to force TrafficStats fallback to /proc/uid_stat/, which is populated with real per-UID stats from /proc/net/dev. Also loads xt_qtaguid on kernel <5.0. Native binder proxy v10.0 with dynamic interfaces and per-UID stat distribution. No BPF restoration - safe for devices where BPF causes 'no internet'. Extensive logging for debugging.

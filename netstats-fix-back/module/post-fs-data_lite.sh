@@ -24,67 +24,20 @@ else
 fi
 
 # ============================================================
-# Phase 1: Create + pin BPF maps (netproxy --maps)
-# Lite = no bpfloader restart. We create the netd HASH maps with
-# the exact layouts libnetworkstats.so expects and populate them
-# from /proc/net/dev. Existing (native) maps are left untouched.
-# This replaces the old "hide BPF maps" strategy which made
-# TrafficStats report 0 (there is no uid_stat fallback anymore).
+# Phase 1: Hide BPF maps to force TrafficStats fallback to /proc/uid_stat/
 # ============================================================
-_log "--- Phase 1: Create BPF maps ---"
+_log "--- Phase 1: Hide BPF maps ---"
 BPF_NETD="/sys/fs/bpf/netd_shared"
-
-find_netproxy() {
-    local probe
-    for probe in \
-        "${0%/*}/system/bin/netproxy" \
-        "/data/adb/modules/netstats-fix/system/bin/netproxy" \
-        "/data/adb/modules/netstats-fix-lite/system/bin/netproxy" \
-        "/system/bin/netproxy"; do
-        [ -f "$probe" ] && { echo "$probe"; return 0; }
+if [ -d "$BPF_NETD" ]; then
+    _log "BPF netd_shared dir exists, hiding maps..."
+    for m in "$BPF_NETD"/*; do
+        if [ -f "$m" ]; then
+            chmod 0000 "$m" 2>/dev/null && _log "  Hidden: $m" || _log "  Cannot hide: $m"
+        fi
     done
-    local found
-    found=$(find /data/adb/modules -name "netproxy" -type f 2>/dev/null | head -1)
-    [ -n "$found" ] && { echo "$found"; return 0; }
-    return 1
-}
-
-select_arch_binary() {
-    local base="$1"
-    local dir; dir=$(dirname "$base")
-    local arch; arch=$(getprop ro.product.cpu.abi 2>/dev/null)
-    case "$arch" in
-        arm64-v8a|arm64)
-            [ -f "$base" ]              && { echo "$base";              return 0; }
-            [ -f "$dir/netproxy_arm" ]  && { echo "$dir/netproxy_arm"; return 0; }
-            ;;
-        armeabi-v7a|armeabi)
-            [ -f "$dir/netproxy_arm" ]  && { echo "$dir/netproxy_arm"; return 0; }
-            [ -f "$base" ]              && { echo "$base";              return 0; }
-            ;;
-        *)
-            [ -f "$base" ]              && { echo "$base";              return 0; }
-            [ -f "$dir/netproxy_arm" ]  && { echo "$dir/netproxy_arm"; return 0; }
-            ;;
-    esac
-    return 1
-}
-
-RAW_BIN=$(find_netproxy)
-if [ -n "$RAW_BIN" ]; then
-    NPROXY_BIN=$(select_arch_binary "$RAW_BIN")
-    [ -z "$NPROXY_BIN" ] && NPROXY_BIN="$RAW_BIN"
-    _log "Creating BPF maps via: $NPROXY_BIN --maps"
-    chmod 755 "$NPROXY_BIN" 2>/dev/null
-    "$NPROXY_BIN" --maps >> "$LOG" 2>&1
-    NP_EXIT=$?
-    _log "netproxy --maps exit code: $NP_EXIT"
-    for MN in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B iface_stats_map iface_index_name_map uid_counterset_map; do
-        p="$BPF_NETD/map_netd_$MN"
-        [ -e "$p" ] && _log "  after create: $MN: present" || _log "  after create: $MN: absent"
-    done
+    _log "BPF maps hidden - TrafficStats will fall back to /proc/uid_stat/"
 else
-    _log "netproxy binary not found; cannot create BPF maps"
+    _log "No BPF maps found (expected for lite)"
 fi
 
 # ============================================================
