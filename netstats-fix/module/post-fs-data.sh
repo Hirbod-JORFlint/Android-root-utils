@@ -253,72 +253,9 @@ else
 fi
 
 # ============================================================
-# BPF map creation fallback (netproxy --maps)
-# If bpfloader did not create real maps, create + pin HASH maps
-# with the EXACT layouts libnetworkstats.so expects (verified
-# against the BTF of netd.o in the tethering APEX), populated
-# from /proc/net/dev. Runs early so the maps exist BEFORE
-# system_server / libnetworkstats.so starts.
-# Only missing maps are created - real eBPF maps are left alone.
-# ============================================================
-find_netproxy() {
-    local probe
-    for probe in \
-        "$MODDIR/system/bin/netproxy" \
-        "${0%/*}/system/bin/netproxy" \
-        "/data/adb/modules/netstats-fix/system/bin/netproxy" \
-        "/data/adb/modules/netstats-fix-lite/system/bin/netproxy" \
-        "/system/bin/netproxy"; do
-        [ -f "$probe" ] && { echo "$probe"; return 0; }
-    done
-    local found
-    found=$(find /data/adb/modules -name "netproxy" -type f 2>/dev/null | head -1)
-    [ -n "$found" ] && { echo "$found"; return 0; }
-    return 1
-}
-
-select_arch_binary() {
-    local base="$1"
-    local dir; dir=$(dirname "$base")
-    local arch; arch=$(getprop ro.product.cpu.abi 2>/dev/null)
-    case "$arch" in
-        arm64-v8a|arm64)
-            [ -f "$base" ]              && { echo "$base";              return 0; }
-            [ -f "$dir/netproxy_arm" ]  && { echo "$dir/netproxy_arm"; return 0; }
-            ;;
-        armeabi-v7a|armeabi)
-            [ -f "$dir/netproxy_arm" ]  && { echo "$dir/netproxy_arm"; return 0; }
-            [ -f "$base" ]              && { echo "$base";              return 0; }
-            ;;
-        *)
-            [ -f "$base" ]              && { echo "$base";              return 0; }
-            [ -f "$dir/netproxy_arm" ]  && { echo "$dir/netproxy_arm"; return 0; }
-            ;;
-    esac
-    return 1
-}
-
-RAW_BIN=$(find_netproxy)
-if [ -n "$RAW_BIN" ]; then
-    NPROXY_BIN=$(select_arch_binary "$RAW_BIN")
-    [ -z "$NPROXY_BIN" ] && NPROXY_BIN="$RAW_BIN"
-    _log "Creating BPF maps via: $NPROXY_BIN --maps"
-    chmod 755 "$NPROXY_BIN" 2>/dev/null
-    "$NPROXY_BIN" --maps >> "$LOG" 2>&1
-    NP_EXIT=$?
-    _log "netproxy --maps exit code: $NP_EXIT"
-    for MN in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B iface_stats_map iface_index_name_map uid_counterset_map; do
-        p="$BPF_NETD/map_netd_$MN"
-        [ -e "$p" ] && _log "  after create: $MN: present" || _log "  after create: $MN: absent"
-    done
-else
-    _log "netproxy binary not found; cannot create BPF maps"
-fi
-
-# ============================================================
 # Status reporting
 # ============================================================
-for MN in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B iface_stats_map iface_index_name_map; do
+for MN in uid_owner_map app_uid_stats_map cookie_tag_map configuration_map stats_map_A stats_map_B; do
     p="$BPF_NETD/map_netd_$MN"
     [ -e "$p" ] && _log "  $MN: present" || _log "  $MN: absent"
 done

@@ -1,6 +1,6 @@
 id=netstats-fix-lite
-name=Network Stats Fix (Proxy + fake BPF maps - Lite)
-version=v17-lite
-versionCode=17
+name=Network Stats Fix (Proxy + uid_stat - Lite)
+version=v16-lite
+versionCode=16
 author=Hirbod-JORFlint
-description=Lightweight fix for broken traffic indicator. Creates+pins the netd BPF maps (exact layouts libnetworkstats.so expects) and keeps them populated from /proc/net/dev. No bpfloader restart - safe for devices where BPF restoration causes 'no internet'. Also /proc/uid_stat/ + xt_qtaguid fallbacks. Native binder proxy v10.1 with dynamic interfaces and per-UID stat distribution. Extensive logging.
+description=Lightweight fix for broken traffic indicator. Hides BPF maps to force TrafficStats fallback to /proc/uid_stat/, which is populated with real per-UID stats from /proc/net/dev. Also loads xt_qtaguid on kernel <5.0. Native binder proxy v10.0 with dynamic interfaces and per-UID stat distribution. No BPF restoration - safe for devices where BPF causes 'no internet'. Extensive logging for debugging. v16: netproxy now uses the real Android 16 INetworkStatsService AIDL transaction codes (verified from framework-connectivity-t.jar).
